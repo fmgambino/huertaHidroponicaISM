@@ -1,0 +1,5 @@
+const SHELL='huerta-h2-shell-v2.3.0',ACTIVE='huerta-patch-active';
+const ASSETS=['./','./index.html','./assets/css/app.css?v=2.3.0','./assets/css/v21.css?v=2.3.0','./assets/js/config.js?v=2.3.0','./assets/js/app.js?v=2.3.0','./assets/icons/icon.svg','./manifest.webmanifest'];
+self.addEventListener('install',event=>event.waitUntil(caches.open(SHELL).then(cache=>cache.addAll(ASSETS)).then(()=>self.skipWaiting())));
+self.addEventListener('activate',event=>event.waitUntil((async()=>{for(const name of await caches.keys()){if(name!==SHELL)await caches.delete(name)}await self.clients.claim()})()));
+self.addEventListener('fetch',event=>{if(event.request.method!=='GET')return;const url=new URL(event.request.url);if(url.origin!==location.origin)return;event.respondWith((async()=>{const patch=await caches.open(ACTIVE),override=await patch.match(event.request,{ignoreSearch:true});if(override)return override;try{const fresh=await fetch(event.request);if(fresh.ok)(await caches.open(SHELL)).put(event.request,fresh.clone());return fresh}catch{return await caches.match(event.request,{ignoreSearch:true})||await caches.match('./index.html')}})())});
