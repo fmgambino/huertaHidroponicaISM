@@ -148,4 +148,263 @@ document.addEventListener('DOMContentLoaded',()=>setTimeout(bindV27,100));
 document.addEventListener('DOMContentLoaded',()=>setTimeout(bindV28,120));
 document.addEventListener('DOMContentLoaded',()=>setTimeout(bindV29,140));
 document.addEventListener('DOMContentLoaded',()=>setTimeout(bindV210,160));
+// Integración v2.12: una fuente de telemetría por dispositivo, sin datos inventados.
+const liveReadings = new Map();
+const latestReadings = new Map();
+const numberText = value => value == null || !Number.isFinite(Number(value)) ? '—' : Number(value).toLocaleString('es-AR',{minimumFractionDigits:2,maximumFractionDigits:2});
+const sensorKey = s => s.key || (s.type==='DHT22' ? (s.unit==='%'?'humidity':'air_temperature') : ({DS18B20:'water_temperature',pH:'ph',TDS:'tds_ppm'})[s.type]);
+const freshDevice = d => !!d?.online && Date.now()-Date.parse(d.lastSeen||'')<45000;
+const brokerLabel = d => !freshDevice(d) ? 'Sin conexión reciente' : d.mqttConnected===true ? 'Conectado' : d.mqttConnected===false ? 'Desconectado' : 'Sin dato';
+const resetLabels = {remote:'Reinicio remoto confirmado',power_on_or_en:'Energización o botón EN (no distinguibles)',external:'Reinicio externo',software:'Reinicio por software',panic:'Error del programa',watchdog:'Watchdog',brownout:'Caída de tensión',deep_sleep:'Salida de suspensión',unknown:'Causa desconocida'};
+
+selectedDevice=function(){return state.devices.find(d=>d.id===$('#deviceSelect')?.value && d.zone===$('#zoneSelect')?.value)};
+const headerBefore212=renderHeader;
+renderHeader=function(){
+  const previousId=state.selectedDeviceId||$('#deviceSelect')?.value;
+  const previousZone=state.selectedZone||$('#zoneSelect')?.value;
+  headerBefore212();
+  const previous=state.devices.find(d=>d.id===previousId);
+  const chosen=previous||(!state.selectedZone?state.devices[0]:null);
+  const zones=[...new Set([...state.zones,...state.devices.map(d=>d.zone)])];
+  const zone=chosen?.zone||(zones.includes(previousZone)?previousZone:zones[0]);
+  $('#zoneSelect').innerHTML=zones.map(z=>`<option value="${esc(z)}">${esc(z)}</option>`).join('');
+  $('#zoneSelect').value=zone||'';
+  const devices=state.devices.filter(d=>d.zone===zone);
+  $('#deviceSelect').innerHTML=devices.length?devices.map(d=>`<option value="${esc(d.id)}">${esc(d.id)}</option>`).join(''):'<option value="">Sin dispositivos en esta zona</option>';
+  $('#deviceSelect').value=devices.find(d=>d.id===chosen?.id)?.id||devices[0]?.id||'';
+  state.selectedDeviceId=$('#deviceSelect').value;state.selectedZone=zone;
+  $('#zoneSelect').onchange=()=>{
+    state.selectedZone=$('#zoneSelect').value;
+    state.selectedDeviceId=state.devices.find(d=>d.zone===state.selectedZone)?.id||'';
+    // Vaciar el selector previo impide que renderHeader restaure la zona anterior.
+    $('#deviceSelect').value='';renderHeader();save();renderDashboard();
+  };
+  $('#deviceSelect').onchange=()=>{state.selectedDeviceId=$('#deviceSelect').value;save();renderDashboard()};
+};
+
+function acceptReading212(reading,source){
+  const device=state.devices.find(d=>d.id===reading.device_id);if(!device)return;
+  const at=Date.parse(reading.created_at||'')||Date.now();
+  const key=reading.boot_id!=null?`${reading.boot_id}:${reading.sequence}`:`${at}`;
+  let buffer=liveReadings.get(device.id);if(!buffer){buffer=new Map();liveReadings.set(device.id,buffer)}
+  const existing=buffer.get(key);
+  const row={...existing,...reading,_at:existing?._at||at,_key:key};
+  buffer.set(key,row);while(buffer.size>720)buffer.delete(buffer.keys().next().value);
+  const old=latestReadings.get(device.id);
+  if(old&&(row._at<old._at||(source==='database'&&row._key===old._key)))return;
+  latestReadings.set(device.id,row);
+  device.lastSeen=new Date(at).toISOString();device.online=Date.now()-at<45000;
+  device.uptimeMs=reading.uptime_ms??device.uptimeMs;
+  device.rssi=reading.wifi_rssi??device.rssi;
+  device.wifi=Number.isFinite(device.rssi)?Math.max(0,Math.min(100,2*(device.rssi+100))):0;
+  for(const [from,to] of Object.entries({mac:'mac',ip:'ip',ssid:'ssid',firmware:'firmware',serial_number:'serial',cpu_temperature:'cpuTemperature',simulated:'simulated',mqtt_connected:'mqttConnected'})){
+    if(reading[from]!=null)device[to]=reading[from];
+  }
+  if(source==='mqtt')device.mqttConnected=true;
+  if(selectedDevice()?.id===device.id)renderDashboard();
+}
+applyReadingV29=reading=>acceptReading212(reading,'database');
+
+// Sustituye los listeners de las versiones anteriores; nunca aplica un equipo a otro.
+connectMqtt=function(){
+  if(!window.mqtt||mqttClient)return;
+  const b=state.settings.broker;
+  mqttClient=window.mqtt.connect(`${b.ssl?'wss':'ws'}://${b.host}:${b.port}${b.path}`,{clientId:`huerta-pwa-${crypto.randomUUID()}`,reconnectPeriod:5000});
+  liveMqttBoundV29=true;
+  mqttClient.on('connect',()=>{state.devices.forEach(d=>mqttClient.subscribe(`huertaiot/${d.id}/#`));renderDashboard()});
+  mqttClient.on('message',(topic,payload)=>{
+    const match=topic.match(/^huertaiot\/(ESP32-[0-9A-F]{4})\/(telemetry|status)$/);if(!match)return;
+    const device=state.devices.find(d=>d.id===match[1]);if(!device)return;
+    if(match[2]==='status'){
+      if(payload.toString().trim()==='offline'){device.online=false;device.mqttConnected=false;renderDashboard()}
+      // Un "online" retenido no demuestra que el ESP32 siga encendido.
+      return;
+    }
+    try{const data=JSON.parse(payload.toString());acceptReading212({...data,device_id:device.id,created_at:new Date().toISOString()},'mqtt')}catch(error){console.warn('Telemetría inválida',error.message)}
+  });
+  for(const event of ['offline','close','error'])mqttClient.on(event,()=>renderDashboard());
+};
+bindLiveMqttV29=function(){if(mqttClient?.connected)state.devices.forEach(d=>mqttClient.subscribe(`huertaiot/${d.id}/#`))};
+startRealtimeV29=async function(){
+  if(realtimeChannelV29||!cloudSessionV24)return;
+  realtimeChannelV29=supabase().channel('huerta-live-212')
+    .on('postgres_changes',{event:'INSERT',schema:'public',table:'sensor_readings'},p=>applyReadingV29(p.new))
+    .on('postgres_changes',{event:'*',schema:'public',table:'devices'},p=>{
+      const d=p.new;if(!d?.id)return;
+      const ix=state.devices.findIndex(x=>x.id===d.id),old=state.devices[ix];
+      const incoming=deviceFromDbV24(d);
+      if(old&&Date.parse(old.lastSeen)>Date.parse(incoming.lastSeen))Object.assign(incoming,{lastSeen:old.lastSeen,online:old.online,mqttConnected:old.mqttConnected,ip:old.ip,mac:old.mac});
+      if(ix<0)state.devices.push(incoming);else state.devices[ix]=incoming;
+      renderHeader();bindLiveMqttV29();renderDashboard();
+    }).subscribe();
+};
+
+const dashboardBefore212=renderDashboard;
+renderDashboard=function(){
+  const d=selectedDevice(),reading=d&&latestReadings.get(d.id);
+  state.sensors.forEach(s=>{const value=(!s.deviceId||s.deviceId===d?.id)?reading?.[sensorKey(s)]:null;s.value=numberText(value)});
+  if(reading?.actuators)state.actuators.forEach(a=>{if(Object.hasOwn(reading.actuators,a.id))a.on=reading.actuators[a.id]===true});
+  dashboardBefore212();
+  $('#simulationBadge')?.remove();
+  const heading=$('#view-dashboard .page-heading');
+  if(heading&&d?.simulated){const badge=document.createElement('span');badge.id='simulationBadge';badge.className='status-pill';badge.textContent='DATOS SIMULADOS · ESP32';heading.appendChild(badge)}
+  const alive=freshDevice(d);
+  $('#connectionPill').textContent=alive?'Encendido · WiFi conectado':'Sin telemetría reciente';
+  if(!d){$('#summaryGrid').innerHTML='<p>Sin dispositivos en esta zona.</p>';$('#sensorGrid').innerHTML='';$('#actuatorGrid').innerHTML='';return}
+  const summary=[['device','Dispositivo',d.id],['wifi','WiFi',alive?`${d.wifi||0}%`:'Sin conexión reciente'],['cloud','Broker del ESP32',brokerLabel(d)],['history','Último dato',d.lastSeen?new Date(d.lastSeen).toLocaleTimeString('es-AR'):'—'],['power','Conexión',alive?'Encendido · WiFi conectado':'Apagado o sin conexión'],['history','Tiempo activo',formatUptime(d.uptimeMs)]];
+  $('#summaryGrid').innerHTML=summary.map(([icon,label,value],i)=>`<article class="summary-card"><i>${svg(icon)}</i><div><span>${label}</span><b>${esc(value)}</b>${i===0?`<small style="display:block">MAC: ${esc(d.mac||'—')}<br>IP: ${esc(d.ip||'—')}<br>Serie: ${esc(d.serial||'—')}</small>`:''}</div></article>`).join('')+`<article class="summary-card"><i>${svg('temperature')}</i><div><span>Temperatura interna ESP32</span><b>${numberText(reading?.cpu_temperature??d.cpuTemperature)} °C</b><small>Lectura orientativa del chip</small></div><button class="mini-action" id="cpuHistory" title="Gráfico e historial">${svg('chart')}</button></article>`;
+  $('#cpuHistory').onclick=()=>sensorChart({name:'Temperatura interna ESP32',key:'cpu_temperature',unit:'°C'});
+  const lastReset=d.lastBoot;
+  if(lastReset)$('#dashboardSubtitle').textContent+=` · Último arranque: ${new Date(lastReset.created_at).toLocaleString('es-AR')}`;
+  for(const card of $$('#sensorGrid [data-sensor-id]')){const s=state.sensors.find(s=>s.id===card.dataset.sensorId);if(s?.deviceId&&s.deviceId!==d.id)card.remove()}
+  for(const card of $$('#actuatorGrid [data-actuator-id]')){const a=state.actuators.find(a=>a.id===card.dataset.actuatorId);if(a?.deviceId&&a.deviceId!==d.id)card.remove()}
+};
+
+const actionBefore212=dashboardAction;
+dashboardAction=async function(action){
+  const d=selectedDevice();if(!d)return actionBefore212(action);
+  if(action==='device-info'){
+    const fields={ID:d.id,Nombre:d.name,Zona:d.zone,Lugar:d.place,Serie:d.serial,MAC:d.mac,IP:d.ip,SSID:d.ssid,Firmware:d.firmware,'Estado':freshDevice(d)?'Conectado':'Sin conexión reciente','Broker MQTT':brokerLabel(d),'Señal WiFi':`${d.wifi||0}% (${d.rssi??'—'} dBm)`,'Temperatura interna':`${numberText(latestReadings.get(d.id)?.cpu_temperature??d.cpuTemperature)} °C`,'Tiempo activo':formatUptime(d.uptimeMs),'Último dato':new Date(d.lastSeen).toLocaleString('es-AR')};
+    return Swal.fire({title:`Dispositivo ${d.id}`,width:650,html:`<div class="device-info-list">${Object.entries(fields).map(([k,v])=>`<p><b>${esc(k)}:</b> ${esc(v||'—')}</p>`).join('')}</div>`});
+  }
+  if(action==='restart-history'){
+    try{const {data,error}=await supabase().from('device_boot_events').select('*').eq('device_id',d.id).order('created_at',{ascending:false}).limit(200);if(error)throw error;
+      return Swal.fire({title:'Historial de reinicios confirmados',width:800,html:`<p>Los registros comienzan con firmware 1.5.0. El ESP32 clásico no siempre distingue energización de botón EN.</p><div style="max-height:50vh;overflow:auto"><table><thead><tr><th>Fecha y hora estimadas</th><th>Causa</th><th>Contador</th></tr></thead><tbody>${data.map(r=>`<tr><td>${esc(new Date(r.created_at).toLocaleString('es-AR'))}</td><td>${esc(resetLabels[r.reason]||r.reason)}</td><td>${r.restart_count??'—'}</td></tr>`).join('')}</tbody></table>${data.length?'':'Sin arranques registrados todavía.'}</div>`});
+    }catch(e){return Swal.fire('No se pudo consultar el historial',e.message,'error')}
+  }
+  return actionBefore212(action);
+};
+
+sensorChart=async function(sensor){
+  const device=selectedDevice();if(!device)return;
+  const key=sensorKey(sensor);if(!key)return Swal.fire('Sin canal de telemetría','Este sensor no tiene una variable de firmware asignada.','info');
+  let chart,timer,closed=false,busy=false,history=[];
+  const localInput=date=>new Date(date.getTime()-date.getTimezoneOffset()*60000).toISOString().slice(0,16);
+  const draw=()=>{
+    if(closed||!chart)return;
+    const live=$('#chartLive').checked;
+    const start=Date.parse($('#chartFrom').value),end=live?Date.now():Date.parse($('#chartTo').value);
+    const mode=$('#chartMode').value;
+    const merged=new Map(history.map(r=>[r.boot_id!=null?`${r.boot_id}:${r.sequence}`:`${r.created_at}`,{...r,_at:Date.parse(r.created_at)}]));
+    if(live)for(const [k,r] of liveReadings.get(device.id)||[])merged.set(k,r);
+    const rows=[...merged.values()].filter(r=>r._at>=start&&r._at<=end).sort((a,b)=>a._at-b._at);
+    chart.data.datasets=[false,true].filter(sim=>mode==='all'||(mode==='simulated')===sim).flatMap(sim=>{
+      const channels=[{key,name:sensor.name,unit:sensor.unit}];
+      if(sensor.type==='DHT22'&&key==='air_temperature')channels.push({key:'humidity',name:'Humedad',unit:'%'});
+      return channels.map(channel=>({label:`${channel.name} ${sim&&channel.key!=='cpu_temperature'?'SIMULADO':channel.key==='cpu_temperature'?'chip':'REAL'} (${channel.unit})`,data:rows.filter(r=>!!r.simulated===sim&&r[channel.key]!=null&&Number.isFinite(Number(r[channel.key]))).map(r=>({x:r._at,y:Number(r[channel.key])})),yAxisID:channel.key==='humidity'?'humidity':'y',borderColor:channel.key==='humidity'?'#22c55e':sim?'#fb923c':'#38bdf8',borderDash:sim?[5,3]:[],pointRadius:1,tension:.15}));
+    });
+    chart.update('none');
+  };
+  const fetchHistory=async()=>{
+    if(busy)return;busy=true;
+    try{
+      const from=new Date($('#chartFrom').value),to=$('#chartLive').checked?new Date():new Date($('#chartTo').value);
+      if(!Number.isFinite(+from)||!Number.isFinite(+to)||from>to)throw Error('Ingresá un rango de fechas válido.');
+      history=[];let truncated=false;
+      for(let offset=0;offset<10000;offset+=1000){
+        const {data,error}=await supabase().from('sensor_readings').select('*').eq('device_id',device.id).gte('created_at',from.toISOString()).lte('created_at',to.toISOString()).order('created_at',{ascending:false}).range(offset,offset+999);
+        if(error)throw error;if(closed)return;history.push(...data);if(data.length<1000)break;if(offset===9000)truncated=true;
+      }
+      if(!closed){$('#chartMessage').textContent=truncated?'Se muestran los últimos 10.000 registros. Acotá el rango para consultar los anteriores.':`${history.length} registros en Supabase. El modo en vivo agrega la telemetría recibida.`;draw()}
+    }catch(e){if(!closed){$('#chartMessage').textContent=`Historial no disponible: ${e.message}. El gráfico en vivo sigue disponible.`;draw()}}
+    finally{busy=false}
+  };
+  return Swal.fire({title:`Historial · ${sensor.name}`,width:1000,html:`<div class="chart-filters"><label>Desde<input id="chartFrom" type="datetime-local" value="${localInput(new Date(Date.now()-6*3600000))}"></label><label>Hasta<input id="chartTo" type="datetime-local" value="${localInput(new Date())}"></label><button id="chartFetch" class="btn primary">Consultar historial</button></div><label><input id="chartLive" type="checkbox" checked> En vivo</label> <select id="chartMode"><option value="all">Todos (series separadas)</option><option value="real">Reales</option><option value="simulated">Simulados</option></select><p id="chartMessage" role="status">Consultando…</p><div class="chart-wrap"><canvas id="historyCanvas"></canvas></div>`,didOpen:()=>{
+    chart=new Chart($('#historyCanvas'),{type:'line',data:{datasets:[]},options:{animation:false,responsive:true,maintainAspectRatio:false,parsing:false,scales:{x:{type:'linear',ticks:{maxTicksLimit:8,callback:v=>new Date(v).toLocaleTimeString('es-AR')}},y:{ticks:{callback:v=>numberText(v)}},humidity:{display:sensor.type==='DHT22',position:'right',title:{display:true,text:'Humedad (%)'},grid:{drawOnChartArea:false}}},plugins:{tooltip:{callbacks:{title:items=>new Date(items[0].parsed.x).toLocaleString('es-AR'),label:item=>`${item.dataset.label}: ${numberText(item.parsed.y)}`}}}}});
+    $('#chartFetch').onclick=fetchHistory;$('#chartMode').onchange=draw;$('#chartLive').onchange=fetchHistory;timer=setInterval(draw,1000);fetchHistory();
+  },willClose:()=>{closed=true;clearInterval(timer);chart?.destroy()}});
+};
+
+const inventoryBefore212=renderInventoryV28;
+renderInventoryV28=function(){inventoryBefore212();for(const row of $$('#inventoryTable tbody tr')){const item=(state.inventory||[]).find(i=>i.id===row.querySelector('b')?.textContent);if(item){const serial=item.serial_number||('ESP'+(item.mac||'').replaceAll(':','').slice(-6));row.cells[0].insertAdjacentHTML('beforeend',`<br><small>Serie: ${esc(serial)}</small>`)}}};
+printInventoryLabelV28=async function(id){
+  if(role()?.id!=='superadmin')return;
+  const item=state.inventory?.find(i=>i.id===id);if(!item)return;
+  const serial=item.serial_number||('ESP'+item.mac.replaceAll(':','').slice(-6));
+  return Swal.fire({title:'Etiqueta de dispositivo',width:620,html:`<div class="device-label"><h3>Proyecto H² · Huerta IoT</h3><b>Serie: ${esc(serial)}</b><p>Device ID: ${esc(item.id)}</p><div class="device-label-grid"><div><svg id="inventoryBarcode"></svg><p>Contraseña: ${esc(item.claim_code)}</p></div><canvas id="inventoryQr"></canvas></div><small>Guardá esta etiqueta: contiene la credencial de vinculación.</small></div>`,confirmButtonText:'Imprimir',showCancelButton:true,didOpen:()=>{if(window.JsBarcode)JsBarcode('#inventoryBarcode',serial,{format:'CODE128',height:50,margin:4});if(window.QRCode)QRCode.toCanvas($('#inventoryQr'),JSON.stringify({serial_number:serial,device_id:id,password:item.claim_code}),{width:180,margin:1})},preConfirm:()=>{if(!window.QRCode||!window.JsBarcode){Swal.showValidationMessage('No cargaron las librerías de QR/código de barras. Verificá la conexión.');return false}window.print();return false}});
+};
+
+let refreshBusy212=false;
+async function refreshTelemetry212(){
+  if(refreshBusy212||!cloudSessionV24)return;refreshBusy212=true;
+  try{
+    const d=selectedDevice();if(!d)return;
+    const [readings,boots]=await Promise.all([
+      supabase().from('sensor_readings').select('*').eq('device_id',d.id).order('created_at',{ascending:false}).limit(1),
+      supabase().from('device_boot_events').select('*').eq('device_id',d.id).order('created_at',{ascending:false}).limit(1)
+    ]);
+    if(readings.error)console.warn('Consulta telemetría:',readings.error.message);
+    if(readings.data?.[0])acceptReading212(readings.data[0],'database');
+    if(boots.data?.[0])d.lastBoot=boots.data[0];
+    renderDashboard();
+  }finally{refreshBusy212=false}
+}
+document.addEventListener('DOMContentLoaded',()=>{setTimeout(()=>{renderHeader();renderDashboard();refreshTelemetry212()},250);setInterval(refreshTelemetry212,15000)});
+
+// Reparación v2.12.1: carga independiente y comandos confirmados por el ESP32.
+const pendingCommands213=new Set();
+function sendActuator213(deviceId,actuatorId,next){
+  if(!mqttClient?.connected)return Promise.reject(Error('El navegador no está conectado al broker MQTT.'));
+  const client=mqttClient,topic=`huertaiot/${deviceId}/command/actuator/${actuatorId}`;
+  return new Promise((resolve,reject)=>{
+    let finished=false,timer;
+    const finish=error=>{if(finished)return;finished=true;clearTimeout(timer);client.removeListener('message',receive);error?reject(error):resolve()};
+    const receive=(incoming,payload,packet)=>{
+      if(packet?.retain||incoming!==`huertaiot/${deviceId}/ack`)return;
+      try{const ack=JSON.parse(payload.toString());if(ack.actuator===actuatorId&&ack.state===next)finish()}catch{}
+    };
+    client.on('message',receive);
+    timer=setTimeout(()=>finish(Error('Sin confirmación del ESP32 en 8 segundos. Revisá el monitor serial y el broker. No se confirmó el cambio.')),8000);
+    client.subscribe(`huertaiot/${deviceId}/ack`,{qos:0},error=>{
+      if(error)return finish(error);if(finished)return;
+      console.info('[MQTT TX]',topic,next?'ON':'OFF');
+      client.publish(topic,next?'ON':'OFF',{qos:0,retain:false},error=>{if(error)finish(error)});
+    });
+  });
+}
+document.addEventListener('click',async e=>{
+  const button=e.target.closest('[data-actuator]');if(!button||!button.closest('#actuatorGrid'))return;
+  // Intercepta antes de los listeners heredados que guardaban éxito local prematuramente.
+  e.preventDefault();e.stopImmediatePropagation();
+  if(!can('actuators'))return;
+  const device=selectedDevice(),a=state.actuators.find(x=>x.id===button.dataset.actuator);
+  if(!device||!a)return;
+  const key=device.id+':'+a.id;if(pendingCommands213.has(key))return;
+  pendingCommands213.add(key);
+  try{
+    if(!freshDevice(device))throw Error('El ESP32 no tiene telemetría reciente. Verificá su conexión antes de enviar comandos.');
+    const next=!a.on;
+    const answer=await Swal.fire({title:'Cambiar estado',text:`¿${next?'Encender':'Apagar'} ${a.name} en ${device.id}?`,showCancelButton:true,confirmButtonText:'Enviar comando'});
+    if(!answer.isConfirmed)return;
+    if(!can('actuators'))throw Error('La sesión ya no tiene permiso para controlar actuadores.');
+    await sendActuator213(device.id,a.id,next);
+    a.on=next;
+    const reading=latestReadings.get(device.id);if(reading){reading.actuators??={};reading.actuators[a.id]=next}
+    a.events??=[];a.events.push({at:new Date().toISOString(),state:next,by:state.currentUser?.name||'Usuario'});
+    save();renderDashboard();toast('ESP32 confirmó el estado del GPIO (sin realimentación física)');
+    if(cloudSessionV24){
+      const {error}=await supabase().from('actuator_events').insert({device_id:device.id,actuator:a.id,state:next,actor_id:cloudSessionV24.user.id});
+      if(error)toast('Estado confirmado; no se pudo guardar el historial: '+error.message,'warning');
+    }
+  }catch(error){Swal.fire('No se confirmó el cambio',error.message,'error')}
+  finally{pendingCommands213.delete(key)}
+},true);
+
+let loadingInventory213=false;
+loadInventoryV28=async function(){
+  if(role()?.id!=='superadmin'||loadingInventory213)return;
+  const box=$('#inventoryTable');if(!box)return;
+  loadingInventory213=true;box.innerHTML='<p role="status">Consultando inventario en Supabase…</p>';
+  try{
+    const client=await requireCloudV24();if(!client){box.innerHTML='<p>Ingresá con tu cuenta real SuperAdmin. La vista previa no consulta el inventario privado.</p>';return}
+    const {data,error}=await client.from('device_inventory').select('*').order('first_seen',{ascending:false});
+    if(error)throw error;
+    state.inventory=data||[];renderInventoryV28();
+    if(!state.inventory.length)box.innerHTML='<div class="empty-state"><h3>Sin registros visibles en device_inventory</h3><p>Un equipo en Dispositivos no implica que se haya enrolado en Inventario. Revisá Inventario HTTP 200/201 en el arranque y el rol de tu cuenta en Supabase. Las políticas RLS también pueden ocultar filas.</p></div>';
+  }catch(error){box.innerHTML=`<div class="empty-state"><h3>No se pudo consultar el inventario</h3><p>${esc(error.code||'')} · ${esc(error.message)}</p><p>No se interpreta este error como inventario vacío. Revisá la migración y las políticas de acceso.</p></div>`}
+  finally{loadingInventory213=false}
+};
+const navigateBefore213=navigate;
+navigate=function(view){const result=navigateBefore213(view);if(view==='inventory'&&can('inventory'))loadInventoryV28();if(view==='devices'&&can('devices'))renderDevices();return result};
+
 })();

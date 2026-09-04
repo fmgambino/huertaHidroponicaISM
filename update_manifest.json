@@ -1,1 +1,1 @@
-{"product":"HUERTA_H2_PWA","version":"2.10.0","minimum_version":"2.9.0","notes":"Diagnóstico de enrolamiento, protección sin dispositivo y reparación automática del broker local.","files":["index.html","assets/css/v21.css","assets/js/app.js"]}
+{"product":"HUERTA_H2_PWA","version":"2.12.1","minimum_version":"2.11.0","files":["index.html","assets/css/v21.css","assets/js/app.js"],"notes":"Corrección de selectores, inventario independiente y comandos MQTT con confirmación del ESP32."}
