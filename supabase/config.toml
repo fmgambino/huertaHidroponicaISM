@@ -1,0 +1,10 @@
+project_id = "jvrrtwlejbymxskijdhj"
+
+[functions.user-admin]
+# La función valida el JWT y el rol SuperAdmin internamente.
+# Desactivar la verificación del gateway permite responder correctamente OPTIONS/CORS.
+verify_jwt = false
+
+[functions.device-enroll]
+# Autenticación de fabricación mediante DEVICE_ENROLLMENT_KEY.
+verify_jwt = false

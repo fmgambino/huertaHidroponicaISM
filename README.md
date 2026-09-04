@@ -1,4 +1,4 @@
-# Proyecto H² — Huerta Hidropónica IoT v2.3.0 · Edición escolar
+# Proyecto H² — Huerta Hidropónica IoT v2.10.0 · Edición escolar Supabase-first
 
 Entrega refactorizada: `hardware/` contiene el firmware ESP32-S3 (PlatformIO + Arduino) y `app/` la PWA mobile-first para GitHub Pages, Supabase, MQTT, EmailJS y actualizaciones por patch.
 
