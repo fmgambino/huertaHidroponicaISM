@@ -1,6 +1,11 @@
 #pragma once
 
-// Credencial solicitada para este lote/prototipo. Debe guardarse con el nombre
-// DEVICE_ENROLLMENT_KEY2 en Supabase Edge Functions > Secrets.
-#define DEVICE_ENROLLMENT_KEY2 "4dc65ce6477b8f973184a21cc43fb12301cf2f65ee736bb370412cb0ac1d5c19"
-
+#ifndef DEVICE_ENROLLMENT_KEY
+#define DEVICE_ENROLLMENT_KEY "H2MFG-7B3E1C9A4F826D50A7C3E91B6D42F805"
+#endif
+#define SUPABASE_URL "https://jvrrtwlejbymxskijdhj.supabase.co"
+#define SUPABASE_ANON_KEY "sb_publishable_DiTLP2axmFKxiIAzgB7jAA_XOQy0d7O"
+#define MQTT_HOST "broker.emqx.io"
+#define MQTT_PORT 1883
+#define MQTT_USER ""
+#define MQTT_PASSWORD ""

@@ -1,0 +1,12 @@
+const fs=require('node:fs'),assert=require('node:assert/strict');
+const code=fs.readFileSync(__dirname+'/src/main.cpp','utf8');
+assert(code.includes('FIRMWARE_VERSION[] = "1.5.1"'));
+assert(code.includes('WiFi.dnsIP(0)')&&code.includes('WiFi.dnsIP(1)'));
+assert(code.includes('resolveHost("jvrrtwlejbymxskijdhj.supabase.co"'));
+assert(code.includes('resolveHost(MQTT_HOST'));
+assert(code.includes('IPAddress dns1(1, 1, 1, 1), dns2(8, 8, 8, 8)'));
+assert(code.includes('if (!ensureDns())'));
+assert(code.includes('if (remote) preferences.remove("remote_reset")'));
+assert(code.includes('mqtt.subscribe((topicBase + "/command/#")'));
+assert(code.includes('[MQTT RX]')&&code.includes('[ACTUADOR APLICADO]'));
+console.log('PASS: diagnóstico/fallback DNS, reintentos, NVS y recepción de actuadores presentes.');

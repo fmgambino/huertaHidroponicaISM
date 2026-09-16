@@ -1,230 +1,439 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <DallasTemperature.h>
+#include <DHT.h>
 #include <HTTPClient.h>
+#include <OneWire.h>
 #include <Preferences.h>
 #include <PubSubClient.h>
+#include <WebServer.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <WiFiManager.h>
+#include <ESPmDNS.h>
 #include <esp_system.h>
-#include <esp_task_wdt.h>
 
-#include "project_config.h"
+#include "pins.h"
 #include "secrets.h"
 
-namespace {
-struct Actuator { const char *id; uint8_t gpio; bool state; };
+#ifndef DEVICE_ENROLLMENT_KEY
+#define DEVICE_ENROLLMENT_KEY "REEMPLAZAR_CON_CLAVE_DE_FABRICACION"
+#endif
 
-Actuator actuators[] = {
-  {"extractor_1", GPIO_EXTRACTOR_1, false}, {"extractor_2", GPIO_EXTRACTOR_2, false},
-  {"ventilador_1", GPIO_VENTILADOR_1, false}, {"ventilador_2", GPIO_VENTILADOR_2, false},
-  {"bomba_agua", GPIO_BOMBA_AGUA, false},  {"lampara_uv", GPIO_LAMPARA_UV, false}
+namespace {
+constexpr char AP_NAME[] = "Huerta Hidroponica IoT ISM";
+constexpr char MDNS_NAME[] = "huertaiot";
+constexpr uint32_t SAMPLE_INTERVAL_MS = 5000;
+constexpr uint32_t PUBLISH_INTERVAL_MS = 5000;
+constexpr char FIRMWARE_VERSION[] = "1.5.1";
+constexpr bool SIMULATE_SENSORS = true; // Cambiar a false al conectar los sensores.
+bool inventoryRegistered = false;
+uint32_t lastEnroll = 0;
+uint32_t lastMqttAttempt = 0;
+uint32_t lastDnsAttempt = 0;
+bool dnsReady = false;
+
+struct Telemetry {
+  float airTemp = NAN;
+  float humidity = NAN;
+  float waterTemp = NAN;
+  float ph = NAN;
+  float tds = NAN;
+  uint32_t sequence = 0;
 };
 
+struct Output {
+  const char *name;
+  uint8_t pin;
+  bool state;
+};
+
+Output outputs[] = {
+  {"extractor_1", PIN_EXTRACTOR_1, false},
+  {"extractor_2", PIN_EXTRACTOR_2, false},
+  {"ventilador_1", PIN_FAN_1, false},
+  {"ventilador_2", PIN_FAN_2, false},
+  {"bomba_agua", PIN_PUMP, false},
+  {"lampara_uv", PIN_UV, false},
+};
+
+DHT dht(PIN_DHT22, DHT22);
+OneWire oneWire(PIN_DS18B20);
+DallasTemperature waterSensor(&oneWire);
+WiFiClient wifiClient;
+WiFiClientSecure supabaseClient;
+PubSubClient mqtt(wifiClient);
+WebServer web(80);
 Preferences preferences;
-WiFiClientSecure mqttTls;
-PubSubClient mqtt(mqttTls);
-WiFiManager wifiManager;
-String deviceId, macAddress, claimCode, bootId;
-uint32_t sequenceNumber = 0;
+Telemetry telemetry;
+String deviceId;
+String topicBase;
+String claimCode;
+String serialNumber;
+String bootId;
+String resetReason;
+uint32_t lastSample = 0;
+uint32_t lastPublish = 0;
 uint32_t restartCount = 0;
-uint32_t lastTelemetry = 0, lastMqttAttempt = 0, lastEnrollAttempt = 0;
-uint32_t wifiResetPressedAt = 0;
-uint32_t lastWifiPortalAttempt = 0;
-bool enrolled = false;
-bool remoteResetRequested = false;
 
-String topic(const String &suffix) { return String(MQTT_ROOT) + "/" + deviceId + "/" + suffix; }
-
-String randomToken(size_t length) {
-  static const char alphabet[] = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  String out; out.reserve(length);
-  for (size_t i = 0; i < length; ++i) out += alphabet[esp_random() % (sizeof(alphabet) - 1)];
-  return out;
+bool resolveHost(const char *host, IPAddress &resolved) {
+  const int result = WiFi.hostByName(host, resolved);
+  Serial.printf("[DNS] %s -> %s (%s)\n", host,
+                result == 1 ? resolved.toString().c_str() : "sin resolver",
+                result == 1 ? "OK" : "ERROR");
+  return result == 1;
 }
 
-String randomHex(size_t length) {
-  static const char hex[] = "0123456789abcdef";
-  String out; out.reserve(length);
-  for (size_t i = 0; i < length; ++i) out += hex[esp_random() & 0x0F];
-  return out;
-}
-
-const char *resetReason() {
-  if (remoteResetRequested || preferences.getBool("remote_reset", false)) return "remote";
-  switch (esp_reset_reason()) {
-    case ESP_RST_POWERON: return "power_on_or_en";
-    case ESP_RST_EXT: return "external";
-    case ESP_RST_SW: return "software";
-    case ESP_RST_PANIC: return "panic";
-    case ESP_RST_INT_WDT: case ESP_RST_TASK_WDT: case ESP_RST_WDT: return "watchdog";
-    case ESP_RST_BROWNOUT: return "brownout";
-    case ESP_RST_DEEPSLEEP: return "deep_sleep";
-    default: return "unknown";
+bool ensureDns(bool force = false) {
+  if (WiFi.status() != WL_CONNECTED) {
+    dnsReady = false;
+    return false;
   }
-}
-
-void writeRelay(Actuator &a) {
-  digitalWrite(a.gpio, RELAY_ACTIVE_LOW ? !a.state : a.state);
-}
-
-void saveActuator(const Actuator &a) { preferences.putBool(a.id, a.state); }
-
-void initializeIdentity() {
-  macAddress = WiFi.macAddress(); macAddress.toUpperCase();
-  String compact = macAddress; compact.replace(":", "");
-  deviceId = "ESP32-" + compact.substring(compact.length() - 4);
-  claimCode = preferences.getString("claim_code", "");
-  if (claimCode.isEmpty()) { claimCode = randomToken(16); preferences.putString("claim_code", claimCode); }
-  bootId = randomHex(8) + "-" + randomHex(4) + "-4" + randomHex(3) + "-a" + randomHex(3) + "-" + randomHex(12);
-  restartCount = preferences.getULong("restart_count", 0) + 1;
-  preferences.putULong("restart_count", restartCount);
-}
-
-bool connectWifiPortal() {
-  lastWifiPortalAttempt = millis();
-  const String portalName = "Huerta-H2-" + deviceId.substring(deviceId.length() - 4);
-  wifiManager.setConfigPortalTimeout(WIFI_PORTAL_TIMEOUT_SECONDS);
-  wifiManager.setConnectTimeout(30);
-  wifiManager.setConnectRetries(3);
-  wifiManager.setWiFiAutoReconnect(true);
-  wifiManager.setTitle("Huerta Hidroponica Inteligente");
-  Serial.printf("[WiFiManager] Red de configuración: %s\n", portalName.c_str());
-  const bool connected = wifiManager.autoConnect(portalName.c_str());
-  Serial.printf("[WiFiManager] %s | IP %s\n", connected ? "Conectado" : "Sin conexión", WiFi.localIP().toString().c_str());
-  return connected;
-}
-
-void handleWifiResetButton() {
-  if (digitalRead(WIFI_RESET_BUTTON_GPIO) == LOW) {
-    if (wifiResetPressedAt == 0) wifiResetPressedAt = millis();
-    if (millis() - wifiResetPressedAt >= WIFI_RESET_HOLD_MS) {
-      Serial.println("[WiFiManager] Borrando Wi-Fi y reiniciando...");
-      wifiManager.resetSettings(); delay(300); ESP.restart();
-    }
-  } else wifiResetPressedAt = 0;
-}
-
-void publishAck(const Actuator &a) {
-  JsonDocument doc; doc["actuator"] = a.id; doc["state"] = a.state;
-  doc["gpio"] = a.gpio; doc["device_id"] = deviceId;
-  char payload[192]; serializeJson(doc, payload, sizeof(payload));
-  mqtt.publish(topic("ack").c_str(), payload, false);
-}
-
-void mqttCallback(char *rawTopic, byte *payload, unsigned int length) {
-  String incomingTopic(rawTopic), body;
-  body.reserve(length); for (unsigned int i = 0; i < length; ++i) body += char(payload[i]);
-  body.trim();
-  if (incomingTopic == topic("command/reset") && (body.equalsIgnoreCase("true") || body == "1")) {
-    Serial.println("[MQTT] Reset remoto confirmado");
-    preferences.putBool("remote_reset", true);
-    mqtt.publish(topic("ack").c_str(), "{\"reset\":true}", false);
-    delay(250); ESP.restart();
+  const uint32_t now = millis();
+  if (!force && dnsReady) return true;
+  if (!force && now - lastDnsAttempt < 30000) return false;
+  lastDnsAttempt = now;
+  Serial.printf("[RED] IP=%s Gateway=%s Mascara=%s DNS1=%s DNS2=%s RSSI=%d dBm\n",
+                WiFi.localIP().toString().c_str(), WiFi.gatewayIP().toString().c_str(),
+                WiFi.subnetMask().toString().c_str(), WiFi.dnsIP(0).toString().c_str(),
+                WiFi.dnsIP(1).toString().c_str(), WiFi.RSSI());
+  IPAddress supabaseIp, mqttIp;
+  if (resolveHost("jvrrtwlejbymxskijdhj.supabase.co", supabaseIp) &&
+      resolveHost(MQTT_HOST, mqttIp)) {
+    dnsReady = true;
+    return true;
   }
-  const String prefix = topic("command/actuator/");
-  if (!incomingTopic.startsWith(prefix)) return;
-  const String id = incomingTopic.substring(prefix.length());
-  for (auto &a : actuators) if (id == a.id) {
-    if (!body.equalsIgnoreCase("ON") && !body.equalsIgnoreCase("OFF")) return;
-    a.state = body.equalsIgnoreCase("ON"); writeRelay(a); saveActuator(a); publishAck(a);
-    Serial.printf("[GPIO] %s GPIO %u = %s\n", a.id, a.gpio, a.state ? "ON" : "OFF");
+  Serial.println("[DNS] El DNS entregado por DHCP fallo; probando 1.1.1.1 y 8.8.8.8");
+  const IPAddress dns1(1, 1, 1, 1), dns2(8, 8, 8, 8);
+  const bool configured = WiFi.config(WiFi.localIP(), WiFi.gatewayIP(),
+                                      WiFi.subnetMask(), dns1, dns2);
+  Serial.printf("[DNS] configuracion alternativa: %s\n", configured ? "OK" : "ERROR");
+  delay(250);
+  dnsReady = resolveHost("jvrrtwlejbymxskijdhj.supabase.co", supabaseIp) &&
+             resolveHost(MQTT_HOST, mqttIp);
+  if (!dnsReady) {
+    Serial.println("[DNS] Sin resolucion. Revisar DNS/Internet del router o bloqueo de puerto 53.");
+  }
+  return dnsReady;
+}
+
+void writeOutput(Output &output, bool enabled) {
+  output.state = enabled;
+  digitalWrite(output.pin, RELAY_ACTIVE_LOW ? !enabled : enabled);
+  preferences.putBool(output.name, enabled);
+}
+
+String makeDeviceId() {
+  const uint64_t mac = ESP.getEfuseMac();
+  char suffix[5];
+  snprintf(suffix, sizeof(suffix), "%04X", static_cast<uint16_t>(mac & 0xFFFF));
+  return String("ESP32-") + suffix;
+}
+
+String makeClaimCode() {
+  constexpr char alphabet[] = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  String code = "H2-";
+  for (uint8_t i = 0; i < 12; ++i) code += alphabet[esp_random() % (sizeof(alphabet) - 1)];
+  return code;
+}
+
+float readPh() {
+  const float voltage = analogReadMilliVolts(PIN_PH) / 1000.0f;
+  // Calibración inicial genérica: pH 7 a 2.50 V y pendiente 0.18 V/pH.
+  return 7.0f + ((2.50f - voltage) / 0.18f);
+}
+
+float readTds(float compensationTemp) {
+  const float voltage = analogReadMilliVolts(PIN_TDS) / 1000.0f;
+  const float temp = isnan(compensationTemp) ? 25.0f : compensationTemp;
+  const float compensation = 1.0f + 0.02f * (temp - 25.0f);
+  const float v = voltage / compensation;
+  return (133.42f * v * v * v - 255.86f * v * v + 857.39f * v) * 0.5f;
+}
+
+void sampleSensors() {
+  if (SIMULATE_SENSORS) {
+    const float phase = millis() / 30000.0f;
+    telemetry.airTemp = 24.0f + 2.0f * sinf(phase);
+    telemetry.humidity = 60.0f + 5.0f * sinf(phase * 0.7f);
+    telemetry.waterTemp = 22.0f + sinf(phase * 0.4f);
+    telemetry.ph = 6.3f + 0.2f * sinf(phase * 0.3f);
+    telemetry.tds = 720.0f + 30.0f * sinf(phase * 0.5f);
+    telemetry.sequence++;
     return;
   }
+  telemetry.airTemp = dht.readTemperature();
+  telemetry.humidity = dht.readHumidity();
+  waterSensor.requestTemperatures();
+  telemetry.waterTemp = waterSensor.getTempCByIndex(0);
+  telemetry.ph = readPh();
+  telemetry.tds = readTds(telemetry.waterTemp);
+  telemetry.sequence++;
+
+  preferences.putFloat("air_temp", telemetry.airTemp);
+  preferences.putFloat("humidity", telemetry.humidity);
+  preferences.putFloat("water_temp", telemetry.waterTemp);
+  preferences.putFloat("ph", telemetry.ph);
+  preferences.putFloat("tds", telemetry.tds);
+  preferences.putUInt("sequence", telemetry.sequence);
 }
 
-bool connectMqtt() {
-  if (WiFi.status() != WL_CONNECTED || mqtt.connected()) return mqtt.connected();
-  if (millis() - lastMqttAttempt < MQTT_RETRY_MS) return false;
-  lastMqttAttempt = millis();
-  const String clientId = deviceId + "-" + String(uint32_t(esp_random()), HEX);
-  const String statusTopic = topic("status");
-  if (!mqtt.connect(clientId.c_str(), statusTopic.c_str(), 0, true, "offline")) {
-    Serial.printf("[MQTT] Error %d\n", mqtt.state()); return false;
-  }
-  mqtt.subscribe(topic("command/#").c_str());
-  mqtt.publish(statusTopic.c_str(), "online", true);
-  Serial.println("[MQTT] Conectado y suscripto a comandos");
-  return true;
+String telemetryJson() {
+  JsonDocument doc;
+  doc["device_id"] = deviceId;
+  doc["sequence"] = telemetry.sequence;
+  doc["air_temperature"] = roundf(telemetry.airTemp * 100) / 100;
+  doc["humidity"] = roundf(telemetry.humidity * 100) / 100;
+  doc["water_temperature"] = roundf(telemetry.waterTemp * 100) / 100;
+  doc["ph"] = roundf(telemetry.ph * 100) / 100;
+  doc["tds_ppm"] = roundf(telemetry.tds * 100) / 100;
+  doc["wifi_rssi"] = WiFi.RSSI();
+  doc["uptime_ms"] = millis();
+  doc["simulated"] = SIMULATE_SENSORS;
+  doc["firmware"] = FIRMWARE_VERSION;
+  doc["serial_number"] = serialNumber;
+  doc["mac"] = WiFi.macAddress();
+  doc["ip"] = WiFi.localIP().toString();
+  doc["ssid"] = WiFi.SSID();
+  doc["mqtt_connected"] = mqtt.connected();
+  doc["wifi_connected"] = WiFi.status() == WL_CONNECTED;
+  doc["cpu_temperature"] = roundf(temperatureRead() * 100) / 100;
+  doc["boot_id"] = bootId;
+  doc["reset_reason"] = resetReason;
+  doc["restart_count"] = restartCount;
+  JsonObject actuatorJson = doc["actuators"].to<JsonObject>();
+  for (const auto &output : outputs) actuatorJson[output.name] = output.state;
+  String payload;
+  serializeJson(doc, payload);
+  return payload;
 }
 
-void addCommonPayload(JsonDocument &doc) {
-  doc["device_id"] = deviceId; doc["mac"] = macAddress; doc["claim_code"] = claimCode;
-  doc["firmware"] = FIRMWARE_VERSION; doc["ip"] = WiFi.localIP().toString();
-  doc["ssid"] = WiFi.SSID(); doc["chip_model"] = ESP.getChipModel(); doc["flash_size"] = ESP.getFlashChipSize();
+void publishState() {
+  if (!mqtt.connected()) return;
+  const String payload = telemetryJson();
+  const bool sent = mqtt.publish((topicBase + "/telemetry").c_str(), payload.c_str(), false);
+  Serial.printf("[TELEMETRIA] modo=%s envio=%s secuencia=%lu\n", SIMULATE_SENSORS ? "SIMULADO" : "REAL", sent ? "OK" : "ERROR", static_cast<unsigned long>(telemetry.sequence));
+  mqtt.publish((topicBase + "/status").c_str(), "online", true);
 }
 
-int postJson(const String &json, String &response) {
-  WiFiClientSecure https; https.setInsecure(); // Prototipo: ver README para CA raíz en producción.
+void sendToSupabase() {
+  if (!inventoryRegistered) return;
+  if (WiFi.status() != WL_CONNECTED || String(SUPABASE_ANON_KEY).startsWith("REEMPLAZAR")) return;
   HTTPClient http;
-  if (!http.begin(https, ENROLL_ENDPOINT)) return -1;
+  http.setConnectTimeout(3000);
+  http.setTimeout(3000);
+  const String endpoint = String(SUPABASE_URL) + "/functions/v1/device-enroll";
+  if (!http.begin(supabaseClient, endpoint)) return;
   http.addHeader("Content-Type", "application/json");
-  http.addHeader("x-enrollment-key", DEVICE_ENROLLMENT_KEY2);
-  const int status = http.POST(json); response = status > 0 ? http.getString() : http.errorToString(status);
-  http.end(); return status;
+  http.addHeader("apikey", SUPABASE_ANON_KEY);
+  http.addHeader("x-enrollment-key", DEVICE_ENROLLMENT_KEY);
+  http.addHeader("Prefer", "return=minimal");
+  JsonDocument reading;
+  deserializeJson(reading, telemetryJson());
+  reading["action"] = "telemetry";
+  reading["claim_code"] = claimCode;
+  String databasePayload;
+  serializeJson(reading, databasePayload);
+  const int status = http.POST(databasePayload);
+  if (status < 200 || status >= 300) Serial.printf("Supabase HTTP %d: %s\n", status, http.getString().c_str());
+  http.end();
 }
 
-bool enroll() {
-  if (WiFi.status() != WL_CONNECTED) return false;
-  JsonDocument doc; addCommonPayload(doc);
-  String json, response; serializeJson(doc, json);
-  const int status = postJson(json, response);
-  Serial.printf("[Enroll] HTTP %d %s\n", status, response.c_str());
-  return status == 200 || status == 201;
+void enrollDevice() {
+  lastEnroll = millis();
+  if (WiFi.status() != WL_CONNECTED || String(DEVICE_ENROLLMENT_KEY).startsWith("REEMPLAZAR")) {
+    Serial.println("Inventario: configure DEVICE_ENROLLMENT_KEY para enrolamiento automatico");
+    return;
+  }
+  if (!ensureDns()) {
+    Serial.println("[INVENTARIO] pospuesto: DNS no disponible; reintento automatico");
+    return;
+  }
+  JsonDocument doc;
+  doc["device_id"] = deviceId;
+  doc["claim_code"] = claimCode;
+  doc["mac"] = WiFi.macAddress();
+  doc["serial_number"] = serialNumber;
+  doc["ip"] = WiFi.localIP().toString();
+  doc["firmware"] = FIRMWARE_VERSION;
+  doc["chip_model"] = ESP.getChipModel();
+  doc["flash_size"] = ESP.getFlashChipSize();
+  String payload;
+  serializeJson(doc, payload);
+  HTTPClient http;
+  const String endpoint = String(SUPABASE_URL) + "/functions/v1/device-enroll";
+  if (!http.begin(supabaseClient, endpoint)) return;
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("apikey", SUPABASE_ANON_KEY);
+  http.addHeader("x-enrollment-key", DEVICE_ENROLLMENT_KEY);
+  const int status = http.POST(payload);
+  const String response = http.getString();
+  Serial.printf("Inventario HTTP %d: %s\n", status, response.c_str());
+  inventoryRegistered = status >= 200 && status < 300;
+  if (status == 401) Serial.println("[INVENTARIO] Verificar DEVICE_ENROLLMENT_KEY en Supabase Secrets: debe coincidir EXACTAMENTE con include/secrets.h. Reintento en 60 s.");
+  http.end();
 }
 
-float noise(float amplitude) { return (int32_t(esp_random() % 2001) - 1000) * amplitude / 1000.0f; }
-float wave(float center, float amplitude, float periodSeconds, float phase = 0) {
-  return center + amplitude * sinf((millis() / 1000.0f + phase) * TWO_PI / periodSeconds);
-}
-float clampf(float value, float low, float high) { return value < low ? low : (value > high ? high : value); }
+void mqttCallback(char *topic, byte *payload, unsigned int length) {
+  String body;
+  body.reserve(length);
+  for (unsigned int i = 0; i < length; ++i) body += static_cast<char>(payload[i]);
+  const String incomingTopic(topic);
+  Serial.printf("[MQTT RX] topic=%s payload=%s\n", topic, body.c_str());
 
-void makeTelemetry(JsonDocument &doc) {
-  const float air = clampf(wave(25.4f, 2.3f, 420.0f) + noise(.18f), 18, 35);
-  const float humidity = clampf(wave(63.0f, 7.5f, 510.0f, 80) + noise(.6f), 40, 90);
-  const float water = clampf(wave(22.2f, 1.1f, 700.0f, 130) + noise(.08f), 17, 29);
-  const float ph = clampf(wave(6.25f, .18f, 600.0f, 40) + noise(.025f), 5.5f, 7.0f);
-  const float tds = clampf(wave(820.0f, 85.0f, 650.0f, 110) + noise(8.0f), 550, 1100);
-  doc["action"] = "telemetry"; addCommonPayload(doc);
-  doc["boot_id"] = bootId; doc["sequence"] = sequenceNumber++; doc["uptime_ms"] = millis();
-  doc["reset_reason"] = resetReason(); doc["restart_count"] = restartCount;
-  doc["air_temperature"] = air; doc["humidity"] = humidity; doc["water_temperature"] = water;
-  doc["ph"] = ph; doc["tds_ppm"] = tds; doc["cpu_temperature"] = temperatureRead();
-  doc["wifi_rssi"] = WiFi.RSSI(); doc["mqtt_connected"] = mqtt.connected(); doc["simulated"] = true;
-  JsonObject states = doc["actuators"].to<JsonObject>();
-  for (const auto &a : actuators) states[a.id] = a.state;
+  if (incomingTopic == topicBase + "/command/reset" && (body == "1" || body == "true")) {
+    preferences.putBool("remote_reset", true);
+    mqtt.publish((topicBase + "/events").c_str(), "remote_reset", false);
+    delay(250);
+    ESP.restart();
+  }
+
+  const String prefix = topicBase + "/command/actuator/";
+  if (!incomingTopic.startsWith(prefix)) return;
+  const String name = incomingTopic.substring(prefix.length());
+  body.trim();
+  body.toUpperCase();
+  if (body != "1" && body != "TRUE" && body != "ON" && body != "0" && body != "FALSE" && body != "OFF") {
+    Serial.println("[ACTUADOR] Comando rechazado: valor invalido");
+    return;
+  }
+  const bool enabled = body == "1" || body == "TRUE" || body == "ON";
+  for (auto &output : outputs) {
+    if (name == output.name) {
+      writeOutput(output, enabled);
+      Serial.printf("[ACTUADOR APLICADO] %s GPIO=%u estado=%s nivel=%d (sin realimentacion fisica)\n", output.name, output.pin, enabled ? "ON" : "OFF", digitalRead(output.pin));
+      JsonDocument ack;
+      ack["actuator"] = output.name;
+      ack["state"] = enabled;
+      String ackPayload;
+      serializeJson(ack, ackPayload);
+      mqtt.publish((topicBase + "/ack").c_str(), ackPayload.c_str(), false);
+      publishState();
+      return;
+    }
+  }
+  Serial.printf("[ACTUADOR] ID desconocido: %s\n", name.c_str());
 }
 
-void sendTelemetry() {
-  JsonDocument doc; makeTelemetry(doc);
-  String json; serializeJson(doc, json);
-  if (mqtt.connected()) mqtt.publish(topic("telemetry").c_str(), json.c_str(), false);
-  String response; const int status = postJson(json, response);
-  Serial.printf("[Telemetry #%lu] HTTP %d %s\n", static_cast<unsigned long>(sequenceNumber - 1), status, response.c_str());
-  if (status == 409 && response.indexOf("Enrolar primero") >= 0) enrolled = false;
-  if (preferences.getBool("remote_reset", false)) preferences.putBool("remote_reset", false);
+void connectMqtt() {
+  if (mqtt.connected() || WiFi.status() != WL_CONNECTED) return;
+  if (millis() - lastMqttAttempt < 5000) return;
+  lastMqttAttempt = millis();
+  if (!ensureDns()) return;
+  const String clientId = deviceId + "-" + String(static_cast<uint32_t>(ESP.getEfuseMac()), HEX);
+  const String willTopic = topicBase + "/status";
+  const bool connected = mqtt.connect(clientId.c_str(), MQTT_USER, MQTT_PASSWORD,
+                                      willTopic.c_str(), 1, true, "offline");
+  if (connected) {
+    const bool subscribed = mqtt.subscribe((topicBase + "/command/#").c_str());
+    Serial.printf("[MQTT] conectado; suscripcion %s/command/#: %s\n", topicBase.c_str(), subscribed ? "OK" : "ERROR");
+    publishState();
+  } else Serial.printf("[MQTT] fallo conexion rc=%d\n", mqtt.state());
 }
-} // namespace
+
+void setupWebServer() {
+  web.on("/", HTTP_GET, [] {
+    JsonDocument doc;
+    doc["name"] = "Huerta Hidroponica IoT ISM";
+    doc["device_id"] = deviceId;
+    doc["mqtt_topic"] = topicBase;
+    doc["telemetry"] = serialized(telemetryJson());
+    String response;
+    serializeJsonPretty(doc, response);
+    web.send(200, "application/json; charset=utf-8", response);
+  });
+  web.on("/health", HTTP_GET, [] { web.send(200, "text/plain", "ok"); });
+  web.onNotFound([] { web.send(404, "application/json", "{\"error\":\"not_found\"}"); });
+  web.begin();
+}
+}  // namespace
 
 void setup() {
-  Serial.begin(115200); delay(300);
-  preferences.begin("huerta-h2", false);
-  pinMode(WIFI_RESET_BUTTON_GPIO, INPUT_PULLUP);
-  for (auto &a : actuators) { a.state = preferences.getBool(a.id, false); pinMode(a.gpio, OUTPUT); writeRelay(a); }
+  Serial.begin(115200);
+  delay(500);
+  deviceId = makeDeviceId();
+  Serial.printf("[BOOT] Firmware %s | Sensores %s\n", FIRMWARE_VERSION, SIMULATE_SENSORS ? "SIMULADOS" : "REALES");
+  topicBase = "huertaiot/" + deviceId;
+
+  preferences.begin("huertaiot", false);
+  bootId = String(esp_random(), HEX) + "-" + String(esp_random(), HEX);
+  const auto cause = esp_reset_reason();
+  const bool remote = preferences.getBool("remote_reset", false);
+  if (remote) preferences.remove("remote_reset");
+  if (remote && cause == ESP_RST_SW) resetReason = "remote";
+  else switch (cause) {
+    case ESP_RST_POWERON: resetReason = "power_on_or_en"; break;
+    case ESP_RST_EXT: resetReason = "external"; break;
+    case ESP_RST_SW: resetReason = "software"; break;
+    case ESP_RST_PANIC: resetReason = "panic"; break;
+    case ESP_RST_INT_WDT: case ESP_RST_TASK_WDT: case ESP_RST_WDT: resetReason = "watchdog"; break;
+    case ESP_RST_BROWNOUT: resetReason = "brownout"; break;
+    case ESP_RST_DEEPSLEEP: resetReason = "deep_sleep"; break;
+    default: resetReason = "unknown";
+  }
+  Serial.printf("[REINICIO] boot=%s causa=%s\n", bootId.c_str(), resetReason.c_str());
+  restartCount = preferences.getUInt("restarts", 0) + 1;
+  preferences.putUInt("restarts", restartCount);
+  telemetry.sequence = preferences.getUInt("sequence", 0);
+  claimCode = preferences.getString("claim_code", "");
+  if (claimCode.isEmpty()) {
+    claimCode = makeClaimCode();
+    preferences.putString("claim_code", claimCode);
+  }
+
+  pinMode(PIN_WIFI_LED, OUTPUT);
+  digitalWrite(PIN_WIFI_LED, LOW);
+  for (auto &output : outputs) {
+    pinMode(output.pin, OUTPUT);
+    writeOutput(output, preferences.getBool(output.name, false));
+  }
+
+  analogReadResolution(12);
+  dht.begin();
+  waterSensor.begin();
+
   WiFi.mode(WIFI_STA);
-  initializeIdentity();
-  connectWifiPortal();
-  mqttTls.setInsecure(); mqtt.setServer(MQTT_HOST, MQTT_PORT); mqtt.setCallback(mqttCallback); mqtt.setBufferSize(2048); mqtt.setKeepAlive(30);
-  Serial.printf("\nHuerta H2 | %s | %s | Claim: %s | Firmware %s\n", deviceId.c_str(), macAddress.c_str(), claimCode.c_str(), FIRMWARE_VERSION);
+  String compactMac = WiFi.macAddress();
+  compactMac.replace(":", "");
+  serialNumber = "ESP" + compactMac.substring(6);
+  WiFiManager manager;
+  manager.setConfigPortalTimeout(180);
+  const bool connected = manager.autoConnect(AP_NAME);
+  digitalWrite(PIN_WIFI_LED, connected ? HIGH : LOW);
+
+  if (connected) {
+    // Algunos routers anuncian WiFi antes de que su DNS esté utilizable.
+    delay(1500);
+    ensureDns(true);
+    supabaseClient.setInsecure();  // Canal TLS dedicado; usar setCACert() en producción.
+    if (MDNS.begin(MDNS_NAME)) MDNS.addService("http", "tcp", 80);
+    setupWebServer();
+    enrollDevice();
+  }
+
+  mqtt.setServer(MQTT_HOST, MQTT_PORT);
+  mqtt.setCallback(mqttCallback);
+  mqtt.setBufferSize(2048);
+  Serial.printf("Device: %s | Claim: %s | http://%s.local | MQTT: %s\n", deviceId.c_str(), claimCode.c_str(), MDNS_NAME, topicBase.c_str());
 }
 
 void loop() {
-  handleWifiResetButton();
-  if (WiFi.status() != WL_CONNECTED && millis() - lastWifiPortalAttempt >= WIFI_PORTAL_RETRY_MS) connectWifiPortal();
+  digitalWrite(PIN_WIFI_LED, WiFi.status() == WL_CONNECTED ? HIGH : LOW);
   if (WiFi.status() == WL_CONNECTED) {
-    if (!enrolled && (lastEnrollAttempt == 0 || millis() - lastEnrollAttempt >= ENROLL_RETRY_MS)) { lastEnrollAttempt = millis(); enrolled = enroll(); }
-    connectMqtt(); mqtt.loop();
-    if (enrolled && (lastTelemetry == 0 || millis() - lastTelemetry >= TELEMETRY_INTERVAL_MS)) { lastTelemetry = millis(); sendTelemetry(); }
+    connectMqtt();
+    mqtt.loop();
+    web.handleClient();
   }
-  delay(5);
+
+  const uint32_t now = millis();
+  if (!inventoryRegistered && now - lastEnroll >= 60000) enrollDevice();
+  if (now - lastSample >= SAMPLE_INTERVAL_MS) {
+    lastSample = now;
+    sampleSensors();
+  }
+  if (now - lastPublish >= PUBLISH_INTERVAL_MS) {
+    lastPublish = now;
+    publishState();
+    sendToSupabase();
+  }
 }
