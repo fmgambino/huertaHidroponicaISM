@@ -562,15 +562,17 @@ function emailConfig214(){
 }
 function renderEmailTemplates214(){
   const cfg=emailConfig214(),box=$('#emailTemplates'),select=$('#emailTestTemplate');if(!box||!select)return;
+  const selected=select.value;
   box.innerHTML=cfg.templates.map((item,index)=>`<div class="email-template-row" data-email-template="${index}"><label>Nombre<input data-template-field="name" value="${esc(item.name||'')}"></label><label>Template ID<input data-template-field="id" value="${esc(item.id||'')}"></label><label>Variable destinatario<input data-template-field="recipientParam" value="${esc(item.recipientParam||'email')}" placeholder="email o to_email"></label><button class="icon-btn" type="button" data-template-delete="${index}" title="Eliminar">${svg('trash')}</button><label>Uso<select data-template-field="purpose"><option value="general" ${item.purpose==='general'?'selected':''}>General</option><option value="deletion" ${item.purpose==='deletion'?'selected':''}>Alerta de eliminación</option><option value="notification" ${item.purpose==='notification'?'selected':''}>Notificación</option></select></label></div>`).join('')||'<p class="form-note">Agregá al menos un template.</p>';
   select.innerHTML=cfg.templates.map((item,index)=>`<option value="${index}">${esc(item.name||item.id||'Template '+(index+1))}</option>`).join('');
+  if([...select.options].some(option=>option.value===selected))select.value=selected;
 }
 function readEmailConfig214(){
-  const form=$('#emailSettingsForm');return{serviceId:form.serviceId.value.trim(),publicKey:form.publicKey.value.trim(),testEmail:form.testEmail.value.trim(),templates:$$('[data-email-template]').map(row=>({name:row.querySelector('[data-template-field="name"]').value.trim(),id:row.querySelector('[data-template-field="id"]').value.trim(),recipientParam:row.querySelector('[data-template-field="recipientParam"]').value.trim()||'email',purpose:row.querySelector('[data-template-field="purpose"]').value})).filter(item=>item.id)};
+  const form=$('#emailSettingsForm');return{serviceId:form.serviceId.value.trim(),publicKey:form.publicKey.value.trim(),testEmail:form.testEmail.value.trim(),templates:$$('#emailTemplates [data-email-template]').map(row=>({name:row.querySelector('[data-template-field="name"]').value.trim(),id:row.querySelector('[data-template-field="id"]').value.trim(),recipientParam:row.querySelector('[data-template-field="recipientParam"]').value.trim()||'to_email',purpose:row.querySelector('[data-template-field="purpose"]').value}))};
 }
 async function persistSettings214(){
   const client=await requireCloudV24();if(!client)return false;
-  const {error}=await client.from('app_settings').upsert({id:'global',value:{settings:state.settings,teamLogo:state.teamLogo},updated_at:new Date().toISOString()});if(error)throw error;return true;
+  const {data,error}=await client.from('app_settings').upsert({id:'global',value:{settings:state.settings,teamLogo:state.teamLogo},updated_at:new Date().toISOString()},{onConflict:'id'}).select('id').single();if(error)throw error;if(!data?.id)throw Error('Supabase no confirmó el guardado de app_settings.');return true;
 }
 const fillSettingsBefore214=fillSettings;
 fillSettings=function(){fillSettingsBefore214();const cfg=emailConfig214(),form=$('#emailSettingsForm');if(form){form.serviceId.value=cfg.serviceId;form.publicKey.value=cfg.publicKey;form.testEmail.value=cfg.testEmail;renderEmailTemplates214()}};
@@ -612,10 +614,26 @@ navigate=function(view){const result=navigateBefore214(view);if(cloudSessionV24&
 document.addEventListener('DOMContentLoaded',()=>{
   $('#publicTeamLink').onclick=showPublicTeam214;
   const form=$('#emailSettingsForm');
-  $('#addEmailTemplate').onclick=()=>{const cfg=emailConfig214();cfg.templates.push({name:'Nuevo template',id:'',recipientParam:'email',purpose:'general'});state.settings.emailjs=cfg;renderEmailTemplates214()};
+  $('#addEmailTemplate').onclick=()=>{const cfg=$$('#emailTemplates [data-email-template]').length?readEmailConfig214():emailConfig214();cfg.templates.push({name:'Nuevo template',id:'',recipientParam:'to_email',purpose:'general'});state.settings.emailjs=cfg;renderEmailTemplates214();$('#emailTestTemplate').value=String(cfg.templates.length-1)};
   $('#emailTemplates').onclick=event=>{const button=event.target.closest('[data-template-delete]');if(!button)return;const cfg=readEmailConfig214();cfg.templates.splice(+button.dataset.templateDelete,1);state.settings.emailjs=cfg;renderEmailTemplates214()};
-  form.onsubmit=async event=>{event.preventDefault();try{state.settings.emailjs=readEmailConfig214();if(!state.settings.emailjs.templates.length)throw Error('Agregá al menos un Template ID.');await persistSettings214();renderEmailTemplates214();toast('Templates de EmailJS guardados')}catch(error){Swal.fire('No se pudo guardar',error.message,'error')}};
-  $('#sendTestEmail').onclick=async()=>{try{const cfg=readEmailConfig214(),template=cfg.templates[+$('#emailTestTemplate').value||0];if(!cfg.serviceId||!cfg.publicKey||!cfg.testEmail||!template?.id)throw Error('Completá Service ID, Public key, destinatario y Template ID.');emailjs.init(cfg.publicKey);const params={to_email:cfg.testEmail,email:cfg.testEmail,recipient:cfg.testEmail,user_email:cfg.testEmail,reply_to:cfg.testEmail,to_name:'Fernando Gambino',subject:'Prueba Proyecto H²',title:'Prueba Proyecto H²',message:'EmailJS configurado correctamente.'};params[template.recipientParam||'email']=cfg.testEmail;await emailjs.send(cfg.serviceId,template.id,params);toast('Email de prueba enviado')}catch(error){Swal.fire('No se pudo enviar',error.text||error.message||String(error),'error')}};
+  $('#emailTemplates').addEventListener('input',event=>{const row=event.target.closest('[data-email-template]');if(!row)return;const index=+row.dataset.emailTemplate;if(event.target.dataset.templateField==='name'&&$('#emailTestTemplate').options[index])$('#emailTestTemplate').options[index].textContent=event.target.value.trim()||`Template ${index+1}`});
+  form.onsubmit=async event=>{event.preventDefault();try{const cfg=readEmailConfig214();cfg.templates=cfg.templates.filter(template=>template.id);if(!cfg.templates.length)throw Error('Agregá al menos un Template ID.');state.settings.emailjs=cfg;await persistSettings214();renderEmailTemplates214();toast('Templates de EmailJS guardados en Supabase')}catch(error){Swal.fire('No se pudo guardar',[error.message,error.details,error.hint].filter(Boolean).join(' · '),'error')}};
+  $('#sendTestEmail').onclick=async()=>{try{const cfg=readEmailConfig214(),selected=Number($('#emailTestTemplate').value||0),template=cfg.templates[selected]||cfg.templates.find(item=>item.id);if(!cfg.serviceId)throw Error('Falta Service ID.');if(!cfg.publicKey)throw Error('Falta Public key.');if(!cfg.testEmail)throw Error('Falta Email de prueba.');if(!template?.id)throw Error('La plantilla seleccionada no tiene Template ID.');emailjs.init(cfg.publicKey);const params={to_email:cfg.testEmail,email:cfg.testEmail,recipient:cfg.testEmail,user_email:cfg.testEmail,reply_to:cfg.testEmail,to_name:'Fernando Gambino',subject:'Prueba Proyecto H²',title:'Prueba Proyecto H²',message:'EmailJS configurado correctamente.'};params[template.recipientParam||'to_email']=cfg.testEmail;await emailjs.send(cfg.serviceId,template.id,params);toast(`Email enviado con ${template.name||template.id}`)}catch(error){Swal.fire('No se pudo enviar',[error.text,error.message,error.status].filter(Boolean).join(' · ')||String(error),'error')}};
 });
+
+// v2.14.1: el estado visual depende de telemetría reciente, nunca de un
+// booleano online histórico que haya quedado guardado en Supabase.
+state.version='2.14.1';
+const deviceOnline2141=device=>device?.online===true&&freshDevice(device);
+renderDevices=function(){
+  const grid=$('#devicesGrid');if(!grid)return;
+  grid.innerHTML=state.devices.map(device=>{const online=deviceOnline2141(device);return`<article class="device-card map-card"><header><h4>${svg('device')} ${esc(device.name)}</h4><span class="status-pill ${online?'online':''}">${online?'Online':'Offline'}</span></header><p><b>${esc(device.id)}</b> · ${esc(device.place||device.zone)}</p><p>${esc(device.address||'Sin domicilio')}</p><iframe loading="lazy" src="${mapUrl(device.address)}" title="Mapa de ${esc(device.name)}"></iframe><div class="card-actions"><button class="icon-btn" data-device-view="${device.id}">${svg('eye')}</button><button class="icon-btn" data-device-edit="${device.id}">${svg('edit')}</button><button class="icon-btn" data-device-delete="${device.id}">${svg('trash')}</button></div></article>`}).join('');
+};
+setInterval(()=>{
+  let changed=false;
+  state.devices.forEach(device=>{if(device.online&&!freshDevice(device)){device.online=false;device.powered=false;device.mqttConnected=false;changed=true}});
+  if(changed)save();
+  if(state.currentUser){renderDevices();renderHeader();renderDashboard()}
+},5000);
 
 })();
