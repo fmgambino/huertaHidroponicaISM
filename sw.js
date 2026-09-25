@@ -1,6 +1,6 @@
-const SHELL='huerta-h2-shell-v2.14.1';
+const SHELL='huerta-h2-shell-v2.14.2';
 const ACTIVE='huerta-patch-active';
-const ASSETS=['./','./index.html','./assets/css/app.css?v=2.14.1','./assets/css/v21.css?v=2.14.1','./assets/js/config.js?v=2.14.1','./assets/js/app.js?v=2.14.1','./assets/icons/icon.svg','./manifest.webmanifest'];
+const ASSETS=['./','./index.html','./assets/css/app.css?v=2.14.2','./assets/css/v21.css?v=2.14.2','./assets/js/config.js?v=2.14.2','./assets/js/app.js?v=2.14.2','./assets/icons/icon.svg','./manifest.webmanifest'];
 
 self.addEventListener('install',event=>event.waitUntil(
   caches.open(SHELL).then(cache=>cache.addAll(ASSETS)).then(()=>self.skipWaiting())

@@ -28,8 +28,8 @@ Deno.serve(async request=>{
       else{const {data:actor}=await admin.from('profiles').select('role').eq('id',record.actor_id).maybeSingle();authorizedSuperAdmin=actor?.role==='superadmin'}
     }
     if(!authorizedSuperAdmin)return reply({ok:true,skipped:'El actor no es SuperAdmin'});
-    const {data:settings,error}=await admin.from('app_settings').select('value').eq('id','global').single();if(error)throw error;
-    const cfg=settings.value?.settings?.emailjs||{},templates=Array.isArray(cfg.templates)?cfg.templates:[];
+    const [{data:dedicated},{data:settings,error}]=await Promise.all([admin.from('app_settings').select('value').eq('id','emailjs').maybeSingle(),admin.from('app_settings').select('value').eq('id','global').maybeSingle()]);if(error)throw error;
+    const cfg=dedicated?.value||settings?.value?.settings?.emailjs||{},templates=Array.isArray(cfg.templates)?cfg.templates:[];
     const template=templates.find((item:any)=>item.purpose==='deletion')||templates[0];
     if(!cfg.serviceId||!cfg.publicKey||!template?.id)throw Error('Configurá Service ID, Public key y un template de eliminación en la PWA.');
     const destination=Deno.env.get('ALERT_EMAIL')||'fernando.m.gambino@gmail.com';

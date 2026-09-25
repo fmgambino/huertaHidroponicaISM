@@ -636,4 +636,57 @@ setInterval(()=>{
   if(state.currentUser){renderDevices();renderHeader();renderDashboard()}
 },5000);
 
+// v2.14.2: EmailJS en una fila propia y carga visual bloqueante por módulo.
+state.version='2.14.2';
+let loaderDepth2142=0,loaderShownAt2142=0;
+function ensureModuleLoader2142(){
+  let loader=$('#moduleLoader');if(loader)return loader;
+  loader=document.createElement('div');loader.id='moduleLoader';loader.className='module-loader';loader.setAttribute('role','status');loader.setAttribute('aria-live','polite');loader.innerHTML='<div class="module-loader-card"><span class="module-spinner" aria-hidden="true"></span><div><b id="moduleLoaderTitle">Actualizando</b><small id="moduleLoaderText">Sincronizando información…</small></div></div>';document.body.appendChild(loader);return loader;
+}
+function showModuleLoader2142(title='Actualizando módulo',text='Sincronizando información…'){
+  const loader=ensureModuleLoader2142();loaderDepth2142++;loaderShownAt2142=loaderShownAt2142||Date.now();$('#moduleLoaderTitle').textContent=title;$('#moduleLoaderText').textContent=text;loader.classList.add('visible');
+}
+async function hideModuleLoader2142(){
+  loaderDepth2142=Math.max(0,loaderDepth2142-1);if(loaderDepth2142)return;
+  const wait=Math.max(0,320-(Date.now()-loaderShownAt2142));if(wait)await new Promise(resolve=>setTimeout(resolve,wait));loaderShownAt2142=0;ensureModuleLoader2142().classList.remove('visible');
+}
+async function loadEmailConfig2142(){
+  if(!cloudSessionV24)return null;
+  const {data,error}=await supabase().from('app_settings').select('value,updated_at').eq('id','emailjs').maybeSingle();if(error)throw error;
+  if(data?.value){state.settings.emailjs=data.value;fillSettings();return data.value}return null;
+}
+persistSettings214=async function(){
+  const client=await requireCloudV24();if(!client)return false;
+  const cfg=state.settings.emailjs;
+  const {data,error}=await client.from('app_settings').upsert({id:'emailjs',value:cfg,updated_at:new Date().toISOString()},{onConflict:'id'}).select('value').single();if(error)throw error;
+  if(!data?.value||JSON.stringify(data.value)!==JSON.stringify(cfg))throw Error('Supabase respondió, pero la configuración leída no coincide con la enviada.');
+  state.settings.emailjs=data.value;save();return true;
+};
+const refreshCollectionsBefore2142=refreshCollections2131;
+refreshCollections2131=async function(){await refreshCollectionsBefore2142();try{await loadEmailConfig2142()}catch(error){console.warn('[EMAILJS SYNC]',error.message)}};
+const loadSupabaseBefore2142=loadSupabaseV24;
+loadSupabaseV24=async function(){showModuleLoader2142('Cargando Proyecto H²','Restaurando sesión y sincronizando módulos…');try{await loadSupabaseBefore2142();await loadEmailConfig2142()}finally{await hideModuleLoader2142()}};
+const navigateBefore2142=navigate;
+navigate=async function(view){
+  const result=navigateBefore2142(view);if(!state.currentUser||!cloudReadyV24)return result;
+  showModuleLoader2142('Actualizando módulo',`Sincronizando ${view}…`);
+  try{if(view==='users')await refreshUsers2131();else if(view==='inventory')await loadInventoryV28();else await refreshCollections2131()}catch(error){console.warn('[MODULE SYNC]',error.message)}finally{await hideModuleLoader2142()}
+  return result;
+};
+document.addEventListener('DOMContentLoaded',()=>{
+  ensureModuleLoader2142();
+  $('#sendTestEmail').onclick=async()=>{
+    showModuleLoader2142('Enviando correo','Guardando la configuración y contactando EmailJS…');
+    try{
+      const cfg=readEmailConfig214(),selected=Number($('#emailTestTemplate').value||0),template=cfg.templates[selected]||cfg.templates.find(item=>item.id);
+      if(!cfg.serviceId)throw Error('Falta Service ID.');if(!cfg.publicKey)throw Error('Falta Public key.');if(!cfg.testEmail)throw Error('Falta Email de prueba.');if(!template?.id)throw Error('La plantilla seleccionada no tiene Template ID.');
+      cfg.templates=cfg.templates.filter(item=>item.id);state.settings.emailjs=cfg;await persistSettings214();
+      emailjs.init(cfg.publicKey);const params={to_email:cfg.testEmail,email:cfg.testEmail,recipient:cfg.testEmail,user_email:cfg.testEmail,reply_to:cfg.testEmail,to_name:'Fernando Gambino',name:'Proyecto H²',from_name:'Proyecto H² · Huerta IoT',subject:'Prueba Proyecto H²',title:'Prueba Proyecto H²',message:'EmailJS configurado correctamente.'};params[template.recipientParam||'to_email']=cfg.testEmail;
+      const response=await emailjs.send(cfg.serviceId,template.id,params);
+      await hideModuleLoader2142();
+      await Swal.fire({icon:'success',title:'Solicitud aceptada por EmailJS',html:`<p>EmailJS respondió <b>${esc(response?.status||200)} ${esc(response?.text||'OK')}</b>.</p><p>Destinatario enviado: <b>${esc(cfg.testEmail)}</b></p><p>Template: <b>${esc(template.id)}</b></p><small>Esta respuesta confirma la recepción de la solicitud, no la entrega final. Si no llega, revisá Email History en EmailJS, spam y que “To Email” use {{${esc(template.recipientParam||'to_email')}}}.</small>`});
+    }catch(error){await hideModuleLoader2142();Swal.fire('No se pudo enviar',[error.text,error.message,error.status,error.details,error.hint].filter(Boolean).join(' · ')||String(error),'error')}
+  };
+});
+
 })();

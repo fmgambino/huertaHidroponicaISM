@@ -24,3 +24,10 @@ body.app-booting #appShell{visibility:hidden}
 .social-links{display:flex;flex-wrap:wrap;gap:.45rem;justify-content:center;margin-top:.6rem}
 .social-links a{color:var(--sky)}
 @media(max-width:700px){.email-template-row{grid-template-columns:1fr}}
+.module-loader{position:fixed;inset:0;z-index:100000;display:grid;place-items:center;background:rgba(2,12,23,.5);backdrop-filter:blur(7px);-webkit-backdrop-filter:blur(7px);opacity:0;pointer-events:none;transition:opacity .18s ease}
+.module-loader.visible{opacity:1;pointer-events:auto}
+.module-loader-card{min-width:220px;padding:1.4rem 1.8rem;border:1px solid var(--line);border-radius:18px;background:var(--panel);box-shadow:0 22px 65px rgba(0,0,0,.38);display:flex;align-items:center;gap:1rem;color:var(--text)}
+.module-spinner{width:34px;height:34px;border:4px solid rgba(56,189,248,.2);border-top-color:var(--sky);border-right-color:var(--eco);border-radius:50%;animation:module-spin .75s linear infinite;flex:0 0 auto}
+.module-loader-card small{display:block;color:var(--muted);margin-top:.2rem}
+@keyframes module-spin{to{transform:rotate(360deg)}}
+@media(prefers-reduced-motion:reduce){.module-spinner{animation-duration:1.8s}.module-loader{transition:none}}
