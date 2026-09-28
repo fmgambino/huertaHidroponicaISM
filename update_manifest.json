@@ -1,1 +1,1 @@
-{"product":"HUERTA_H2_PWA","version":"2.15.1","minimum_version":"2.15.0","files":["index.html","assets/js/app.js","sw.js"],"notes":"Separa la configuración de climatización y dosificación: ventilación sólo temperatura/humedad; bombas sólo pH/pulsos."}
+{"product":"HUERTA_H2_PWA","version":"2.15.2","minimum_version":"2.15.1","files":["index.html","assets/js/app.js","assets/js/config.js","sw.js"],"notes":"Estabiliza la detección online: reconexión MQTT más rápida y tolerancia a latencia sin falsos desconectados."}

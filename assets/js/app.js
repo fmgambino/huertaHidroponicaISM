@@ -156,7 +156,7 @@ async function startRealtimeV29(){if(realtimeChannelV29||!cloudSessionV24)return
 function bindLiveMqttV29(){if(!mqttClient||liveMqttBoundV29)return;liveMqttBoundV29=true;const subscribe=()=>state.devices.forEach(device=>{mqttClient.subscribe(`huertaiot/${device.id}/telemetry`);mqttClient.subscribe(`huertaiot/${device.id}/status`)});mqttClient.on('connect',subscribe);if(mqttClient.connected)subscribe();mqttClient.on('message',(topic,payload)=>{const match=topic.match(/^huertaiot\/(ESP32-[0-9A-F]{4})\/status$/);if(!match)return;const device=state.devices.find(item=>item.id===match[1]);if(!device)return;const online=payload.toString().trim().toLowerCase()==='online';device.online=online;device.powered=online;if(online)device.lastSeen=new Date().toISOString();save();renderDashboard()})}
 const loadSupabaseV29Base=loadSupabaseV24;loadSupabaseV24=async function(){await loadSupabaseV29Base();await startRealtimeV29();bindLiveMqttV29();if(role()?.id==='superadmin'&&cloudSessionV24)await loadInventoryV28()};
 const renderDashboardV29Base=renderDashboard;renderDashboard=function(){renderDashboardV29Base();const device=selectedDevice();if(!device)return;const pill=$('#connectionPill');if(pill)pill.textContent=device.online?'Encendido · WiFi conectado':'Apagado o sin conexión';const connection=[...document.querySelectorAll('#summaryGrid .summary-card')].find(card=>card.querySelector('span')?.textContent==='Conexión');if(connection)connection.querySelector('b').textContent=device.online?'Encendido · WiFi conectado':'Apagado / desconectado'};
-function bindV29(){setInterval(()=>{let changed=false;const now=Date.now();state.devices.forEach(device=>{if(device.online&&now-new Date(device.lastSeen||0).getTime()>20000){device.online=false;device.powered=false;changed=true}});if(changed){save();renderDashboard()}},5000)}
+function bindV29(){setInterval(()=>{let changed=false;const now=Date.now();state.devices.forEach(device=>{if(device.online&&now-new Date(device.lastSeen||0).getTime()>45000){device.online=false;device.powered=false;changed=true}});if(changed){save();renderDashboard()}},5000)}
 const dashboardActionV210Base=dashboardAction;dashboardAction=async function(action){if(!selectedDevice())return Swal.fire('Sin dispositivo','Primero vinculá o seleccioná un dispositivo.','info');return dashboardActionV210Base(action)};
 function bindV210(){const broker=state.settings.broker||{};if(/^(127\.0\.0\.1|localhost)$/i.test(broker.host||'')){state.settings.broker={...C.mqtt};save();if(mqttClient){mqttClient.end(true);mqttClient=null;liveMqttBoundV29=false}connectMqtt();setTimeout(bindLiveMqttV29,500)}}
 document.addEventListener('DOMContentLoaded',init);
@@ -175,7 +175,9 @@ const liveReadings = new Map();
 const latestReadings = new Map();
 const numberText = value => value == null || !Number.isFinite(Number(value)) ? '—' : Number(value).toLocaleString('es-AR',{minimumFractionDigits:2,maximumFractionDigits:2});
 const sensorKey = s => s.channel || s.key || (s.type==='DHT22' ? (s.unit==='%'?'humidity':'air_temperature') : ({HUMIDITY:'humidity',DS18B20:'water_temperature',pH:'ph',TDS:'tds_ppm',CPU:'cpu_temperature'})[s.type]);
-const freshDevice = d => {const at=Date.parse(d?.lastSeen||'');return Number.isFinite(at)&&Date.now()-at>=0&&Date.now()-at<20000};
+// El firmware publica cada 5 s. Se toleran hasta 45 s (nueve ciclos), pequeños
+// saltos del reloj y una operación HTTPS lenta sin declarar falsos offline.
+const freshDevice = d => {const at=Date.parse(d?.lastSeen||'');const age=Date.now()-at;return Number.isFinite(at)&&age>-15000&&age<45000};
 const brokerLabel = d => !freshDevice(d) ? 'Sin conexión reciente' : d.mqttConnected===true ? 'Conectado' : d.mqttConnected===false ? 'Desconectado' : 'Sin dato';
 const resetLabels = {remote:'Reinicio remoto confirmado',power_on_or_en:'Energización o botón EN (no distinguibles)',external:'Reinicio externo',software:'Reinicio por software',panic:'Error del programa',watchdog:'Watchdog',brownout:'Caída de tensión',deep_sleep:'Salida de suspensión',unknown:'Causa desconocida'};
 
@@ -215,7 +217,7 @@ function acceptReading212(reading,source){
   const old=latestReadings.get(device.id);
   if(old&&(row._at<old._at||(source==='database'&&row._key===old._key)))return;
   latestReadings.set(device.id,row);
-  device.lastSeen=new Date(at).toISOString();device.online=Date.now()-at<20000;
+  device.lastSeen=new Date(at).toISOString();device.online=Date.now()-at<45000;
   device.uptimeMs=reading.uptime_ms??device.uptimeMs;
   device.rssi=reading.wifi_rssi??device.rssi;
   device.wifi=Number.isFinite(device.rssi)?Math.max(0,Math.min(100,2*(device.rssi+100))):0;
@@ -231,7 +233,7 @@ applyReadingV29=reading=>acceptReading212(reading,'database');
 connectMqtt=function(){
   if(!window.mqtt||mqttClient)return;
   const b=state.settings.broker;
-  mqttClient=window.mqtt.connect(`${b.ssl?'wss':'ws'}://${b.host}:${b.port}${b.path}`,{clientId:`huerta-pwa-${crypto.randomUUID()}`,reconnectPeriod:5000});
+  mqttClient=window.mqtt.connect(`${b.ssl?'wss':'ws'}://${b.host}:${b.port}${b.path}`,{clientId:`huerta-pwa-${crypto.randomUUID()}`,clean:true,keepalive:30,connectTimeout:10000,reconnectPeriod:2000,resubscribe:true});
   liveMqttBoundV29=true;
   mqttClient.on('connect',()=>{state.devices.forEach(d=>mqttClient.subscribe(`huertaiot/${d.id}/#`));renderDashboard()});
   mqttClient.on('message',(topic,payload)=>{
@@ -485,7 +487,7 @@ document.addEventListener('DOMContentLoaded',()=>{
 });
 
 // v2.15.0 · Automatización hidropónica con histéresis e historial persistente.
-state.version='2.15.1';
+state.version='2.15.2';
 icons.flask='<path d="M9 2h6M10 2v6l-5.5 9.2A3 3 0 0 0 7.1 22h9.8a3 3 0 0 0 2.6-4.8L14 8V2"/><path d="M7 16h10"/>';
 icons.beaker='<path d="M8 3h8M9 3v6l-5 9a2 2 0 0 0 1.8 3h12.4a2 2 0 0 0 1.8-3l-5-9V3"/><path d="M6 16h12"/>';
 actuatorTypes.nutriente={label:'Bomba de solución nutritiva',icons:['flask','beaker','drop']};
@@ -756,6 +758,6 @@ document.addEventListener('DOMContentLoaded',()=>{
 });
 
 // Debe quedar después de todos los overrides heredados.
-state.version='2.15.1';
+state.version='2.15.2';
 
 })();
