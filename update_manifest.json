@@ -1,1 +1,1 @@
-{"product":"HUERTA_H2_PWA","version":"2.12.1","minimum_version":"2.11.0","files":["index.html","assets/css/v21.css","assets/js/app.js"],"notes":"Corrección de selectores, inventario independiente y comandos MQTT con confirmación del ESP32."}
+{"product":"HUERTA_H2_PWA","version":"2.15.1","minimum_version":"2.15.0","files":["index.html","assets/js/app.js","sw.js"],"notes":"Separa la configuración de climatización y dosificación: ventilación sólo temperatura/humedad; bombas sólo pH/pulsos."}

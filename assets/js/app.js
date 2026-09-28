@@ -484,6 +484,71 @@ document.addEventListener('DOMContentLoaded',()=>{
   setInterval(()=>{if(state.currentUser&&selectedDevice())renderDashboard()},5000);
 });
 
+// v2.15.0 · Automatización hidropónica con histéresis e historial persistente.
+state.version='2.15.1';
+icons.flask='<path d="M9 2h6M10 2v6l-5.5 9.2A3 3 0 0 0 7.1 22h9.8a3 3 0 0 0 2.6-4.8L14 8V2"/><path d="M7 16h10"/>';
+icons.beaker='<path d="M8 3h8M9 3v6l-5 9a2 2 0 0 0 1.8 3h12.4a2 2 0 0 0 1.8-3l-5-9V3"/><path d="M6 16h12"/>';
+actuatorTypes.nutriente={label:'Bomba de solución nutritiva',icons:['flask','beaker','drop']};
+const automatedActuators215=new Set(['bomba_nutriente_a','bomba_nutriente_b','ventilador_1','ventilador_2','extractor_1','extractor_2']);
+const defaultAutomation215={ventilation_enabled:true,dosing_enabled:true,ph_min:5.5,ph_max:6.5,temp_min:22,temp_max:28,humidity_min:50,humidity_max:75,dose_ms:3000,cooldown_ms:60000};
+
+function firmwareActuator215(actuator){return actuator?.firmwareId||String(actuator?.id||'').split('__').at(-1)}
+async function publishAutomation215(deviceId,settings){
+  if(!mqttClient?.connected)throw Error('La configuración quedó guardada en Supabase, pero el navegador no está conectado al broker MQTT. Se enviará cuando vuelvas a guardar con el broker conectado.');
+  const payload=JSON.stringify({ventilation_enabled:settings.ventilation_enabled,dosing_enabled:settings.dosing_enabled,ph_min:settings.ph_min,ph_max:settings.ph_max,temp_min:settings.temp_min,temp_max:settings.temp_max,humidity_min:settings.humidity_min,humidity_max:settings.humidity_max,dose_ms:settings.dose_ms,cooldown_ms:settings.cooldown_ms});
+  await new Promise((resolve,reject)=>mqttClient.publish(`huertaiot/${deviceId}/command/config`,payload,{qos:1,retain:true},error=>error?reject(error):resolve()));
+}
+async function openAutomation215(actuator){
+  const device=selectedDevice();if(!device)return;
+  showModuleLoader2142('Cargando automatización','Consultando rangos e historial…');
+  try{
+    const client=await requireCloudV24();if(!client)throw Error('Se requiere una sesión válida.');
+    const key=firmwareActuator215(actuator),[settingsResult,eventsResult]=await Promise.all([
+      client.from('automation_settings').select('*').eq('device_id',device.id).maybeSingle(),
+      client.from('actuator_events').select('actuator,state,source,reason,sensor_snapshot,created_at').eq('device_id',device.id).in('actuator',['bomba_nutriente_a','bomba_nutriente_b','ventilador_1','ventilador_2','extractor_1','extractor_2']).order('created_at',{ascending:false}).limit(100)
+    ]);if(settingsResult.error)throw settingsResult.error;if(eventsResult.error)throw eventsResult.error;
+    const cfg={...defaultAutomation215,...settingsResult.data};
+    await hideModuleLoader2142();
+    const history=(eventsResult.data||[]).filter(event=>event.actuator===key).map(event=>`<tr><td>${new Date(event.created_at).toLocaleString('es-AR')}</td><td><span class="status-pill ${event.state?'online':''}">${event.state?'ON':'OFF'}</span></td><td>${esc(event.source||'—')}</td><td>${esc(event.reason||'—')}</td><td>${esc(JSON.stringify(event.sensor_snapshot||{}))}</td></tr>`).join('');
+    const result=await Swal.fire({title:`Automatización · ${esc(actuator.name)}`,width:980,html:`<div class="popup-form two"><label class="toggle-row wide"><input id="autoEnabled" type="checkbox" ${cfg.enabled?'checked':''}> Automatización habilitada</label><label>pH MIN<input id="autoPhMin" type="number" min="0" max="14" step="0.01" value="${cfg.ph_min}"></label><label>pH MAX<input id="autoPhMax" type="number" min="0" max="14" step="0.01" value="${cfg.ph_max}"></label><label>Temperatura MIN (°C)<input id="autoTempMin" type="number" step="0.1" value="${cfg.temp_min}"></label><label>Temperatura MAX (°C)<input id="autoTempMax" type="number" step="0.1" value="${cfg.temp_max}"></label><label>Humedad MIN (%)<input id="autoHumMin" type="number" min="0" max="100" step="0.1" value="${cfg.humidity_min}"></label><label>Humedad MAX (%)<input id="autoHumMax" type="number" min="0" max="100" step="0.1" value="${cfg.humidity_max}"></label><label>Pulso bomba (ms)<input id="autoDose" type="number" min="500" max="15000" step="100" value="${cfg.dose_ms}"></label><label>Espera entre dosis (ms)<input id="autoCooldown" type="number" min="10000" max="3600000" step="1000" value="${cfg.cooldown_ms}"></label></div><h3>Historial de activación</h3><div class="table-wrap"><table><thead><tr><th>Fecha</th><th>Estado</th><th>Origen</th><th>Motivo</th><th>Lecturas</th></tr></thead><tbody>${history||'<tr><td colspan="5">Sin eventos registrados.</td></tr>'}</tbody></table></div>`,showCancelButton:true,confirmButtonText:'Guardar y enviar al ESP32',cancelButtonText:'Cerrar',preConfirm:()=>{const value={enabled:$('#autoEnabled').checked,ph_min:+$('#autoPhMin').value,ph_max:+$('#autoPhMax').value,temp_min:+$('#autoTempMin').value,temp_max:+$('#autoTempMax').value,humidity_min:+$('#autoHumMin').value,humidity_max:+$('#autoHumMax').value,dose_ms:+$('#autoDose').value,cooldown_ms:+$('#autoCooldown').value};if(value.ph_min>=value.ph_max)return Swal.showValidationMessage('pH MIN debe ser menor que pH MAX.');if(value.temp_min>=value.temp_max)return Swal.showValidationMessage('Temperatura MIN debe ser menor que MAX.');if(value.humidity_min>=value.humidity_max)return Swal.showValidationMessage('Humedad MIN debe ser menor que MAX.');return value}});
+    if(!result.isConfirmed)return;
+    showModuleLoader2142('Guardando automatización','Sincronizando Supabase y ESP32…');
+    const payload={device_id:device.id,...result.value,updated_by:cloudSessionV24.user.id,updated_at:new Date().toISOString()};const {error}=await client.from('automation_settings').upsert(payload,{onConflict:'device_id'});if(error)throw error;
+    let warning='';try{await publishAutomation215(device.id,result.value);toast('Rangos guardados y enviados al ESP32')}catch(error){warning=error.message}
+    await hideModuleLoader2142();if(warning)await Swal.fire('Guardado con advertencia',warning,'warning');return;
+  }catch(error){await hideModuleLoader2142();Swal.fire('No se pudo abrir la automatización',error.message||String(error),'error');return}
+  await hideModuleLoader2142();
+}
+
+openAutomation215=async function(actuator){
+  const device=selectedDevice();if(!device)return;
+  const key=firmwareActuator215(actuator),dosing=key==='bomba_nutriente_a'||key==='bomba_nutriente_b';
+  showModuleLoader2142('Cargando automatización',dosing?'Consultando control de pH…':'Consultando control ambiental…');
+  try{
+    const client=await requireCloudV24();if(!client)throw Error('Se requiere una sesión válida.');
+    const [settingsResult,eventsResult]=await Promise.all([client.from('automation_settings').select('*').eq('device_id',device.id).maybeSingle(),client.from('actuator_events').select('actuator,state,source,reason,sensor_snapshot,created_at').eq('device_id',device.id).eq('actuator',key).order('created_at',{ascending:false}).limit(100)]);
+    if(settingsResult.error)throw settingsResult.error;if(eventsResult.error)throw eventsResult.error;
+    const cfg={...defaultAutomation215,...settingsResult.data};if(settingsResult.data?.enabled!=null){cfg.ventilation_enabled??=settingsResult.data.enabled;cfg.dosing_enabled??=settingsResult.data.enabled}
+    await hideModuleLoader2142();
+    const history=(eventsResult.data||[]).map(event=>`<tr><td>${new Date(event.created_at).toLocaleString('es-AR')}</td><td><span class="status-pill ${event.state?'online':''}">${event.state?'ON':'OFF'}</span></td><td>${esc(event.source||'—')}</td><td>${esc(event.reason||'—')}</td><td>${esc(JSON.stringify(event.sensor_snapshot||{}))}</td></tr>`).join('');
+    const controls=dosing?`<label class="toggle-row wide"><input id="autoEnabled" type="checkbox" ${cfg.dosing_enabled?'checked':''}> Dosificación por pH habilitada</label><label>pH MIN<input id="autoPhMin" type="number" min="0" max="14" step="0.01" value="${cfg.ph_min}"></label><label>pH MAX<input id="autoPhMax" type="number" min="0" max="14" step="0.01" value="${cfg.ph_max}"></label><label>Pulso de bomba (ms)<input id="autoDose" type="number" min="500" max="15000" step="100" value="${cfg.dose_ms}"></label><label>Espera entre dosis (ms)<input id="autoCooldown" type="number" min="10000" max="3600000" step="1000" value="${cfg.cooldown_ms}"></label>`:`<label class="toggle-row wide"><input id="autoEnabled" type="checkbox" ${cfg.ventilation_enabled?'checked':''}> Ventilación automática habilitada</label><label>Temperatura MIN (°C)<input id="autoTempMin" type="number" step="0.1" value="${cfg.temp_min}"></label><label>Temperatura MAX (°C)<input id="autoTempMax" type="number" step="0.1" value="${cfg.temp_max}"></label><label>Humedad MIN (%)<input id="autoHumMin" type="number" min="0" max="100" step="0.1" value="${cfg.humidity_min}"></label><label>Humedad MAX (%)<input id="autoHumMax" type="number" min="0" max="100" step="0.1" value="${cfg.humidity_max}"></label>`;
+    const result=await Swal.fire({title:dosing?`Dosificación pH · ${esc(actuator.name)}`:`Climatización · ${esc(actuator.name)}`,width:980,html:`<div class="popup-form two">${controls}</div><h3>Historial de activación</h3><div class="table-wrap"><table><thead><tr><th>Fecha</th><th>Estado</th><th>Origen</th><th>Motivo</th><th>Lecturas</th></tr></thead><tbody>${history||'<tr><td colspan="5">Sin eventos registrados.</td></tr>'}</tbody></table></div>`,showCancelButton:true,confirmButtonText:'Guardar y enviar al ESP32',cancelButtonText:'Cerrar',preConfirm:()=>{const value={...cfg};if(dosing){Object.assign(value,{dosing_enabled:$('#autoEnabled').checked,ph_min:+$('#autoPhMin').value,ph_max:+$('#autoPhMax').value,dose_ms:+$('#autoDose').value,cooldown_ms:+$('#autoCooldown').value});if(value.ph_min>=value.ph_max)return Swal.showValidationMessage('pH MIN debe ser menor que pH MAX.')}else{Object.assign(value,{ventilation_enabled:$('#autoEnabled').checked,temp_min:+$('#autoTempMin').value,temp_max:+$('#autoTempMax').value,humidity_min:+$('#autoHumMin').value,humidity_max:+$('#autoHumMax').value});if(value.temp_min>=value.temp_max)return Swal.showValidationMessage('Temperatura MIN debe ser menor que MAX.');if(value.humidity_min>=value.humidity_max)return Swal.showValidationMessage('Humedad MIN debe ser menor que MAX.')}delete value.device_id;delete value.updated_at;delete value.updated_by;delete value.enabled;return value}});
+    if(!result.isConfirmed)return;
+    showModuleLoader2142('Guardando automatización',dosing?'Actualizando dosificación…':'Actualizando climatización…');
+    const payload={device_id:device.id,...result.value,updated_by:cloudSessionV24.user.id,updated_at:new Date().toISOString()};const {error}=await client.from('automation_settings').upsert(payload,{onConflict:'device_id'});if(error)throw error;
+    let warning='';try{await publishAutomation215(device.id,result.value);toast(dosing?'Dosificación guardada':'Climatización guardada')}catch(error){warning=error.message}await hideModuleLoader2142();if(warning)await Swal.fire('Guardado con advertencia',warning,'warning');return;
+  }catch(error){await hideModuleLoader2142();Swal.fire('No se pudo abrir la automatización',error.message||String(error),'error')}
+};
+
+document.addEventListener('click',event=>{
+  const info=event.target.closest('[data-actuator-action="info"]'),card=event.target.closest('[data-actuator-id]');if(!info||!card)return;
+  const actuator=state.actuators.find(item=>item.id===card.dataset.actuatorId);if(!automatedActuators215.has(firmwareActuator215(actuator)))return;
+  event.preventDefault();event.stopImmediatePropagation();openAutomation215(actuator);
+},true);
+
+const startRealtimeBefore215=startRealtimeV29;
+startRealtimeV29=async function(){await startRealtimeBefore215();if(!realtimeChannelV29)return;realtimeChannelV29.on('postgres_changes',{event:'INSERT',schema:'public',table:'actuator_events'},payload=>{const row=payload.new;if(!automatedActuators215.has(row.actuator))return;toast(`${row.actuator}: ${row.state?'activado':'desactivado'} · ${row.reason||row.source}`,row.state?'warning':'success')}).on('postgres_changes',{event:'*',schema:'public',table:'automation_settings'},()=>{if(document.querySelector('.swal2-container'))return;toast('Configuración automática actualizada')})};
+
 // v2.13.1: sincronización integral sin recargar la página.
 let syncBusy2131=false,syncTimer2131=null,userSyncBusy2131=false,fallbackTimer2131=null;
 async function refreshUsers2131(){
@@ -547,6 +612,7 @@ startRealtimeV29=async function(){
       state.audit=state.audit.slice(0,500);
       renderAudit();
     })
+    .on('postgres_changes',{event:'INSERT',schema:'public',table:'actuator_events'},payload=>{const row=payload.new;if(automatedActuators215.has(row.actuator))toast(`${row.actuator}: ${row.state?'activado':'desactivado'} · ${row.reason||row.source}`,row.state?'warning':'success')})
     .on('postgres_changes',{event:'*',schema:'public',table:'device_inventory'},()=>{if(role()?.id==='superadmin')loadInventoryV28()})
     .subscribe(status=>{if(status==='CHANNEL_ERROR'||status==='TIMED_OUT')console.warn('[REALTIME]',status)});
   clearInterval(fallbackTimer2131);
@@ -688,5 +754,8 @@ document.addEventListener('DOMContentLoaded',()=>{
     }catch(error){await hideModuleLoader2142();Swal.fire('No se pudo enviar',[error.text,error.message,error.status,error.details,error.hint].filter(Boolean).join(' · ')||String(error),'error')}
   };
 });
+
+// Debe quedar después de todos los overrides heredados.
+state.version='2.15.1';
 
 })();

@@ -20,6 +20,15 @@ Deno.serve(async request=>{
     if(existing&&(existing.mac!==mac||existing.secret_hash!==secretHash))return json({error:'ID existente con otra MAC o contraseña. No se sobrescribió.'},409);
     if(existing&&['blocked','retired'].includes(existing.status))return json({error:'Dispositivo bloqueado'},403);
     const serialNumber='ESP'+mac.replaceAll(':','').slice(-6);
+    if(body.action==='actuator_event'){
+      if(!existing)return json({error:'Enrolar primero'},409);
+      const actuator=String(body.actuator||''),allowedActuators=new Set(['extractor_1','extractor_2','ventilador_1','ventilador_2','bomba_agua','lampara_uv','bomba_nutriente_a','bomba_nutriente_b']);
+      if(!allowedActuators.has(actuator)||typeof body.state!=='boolean')return json({error:'Evento de actuador inválido'},400);
+      const event={device_id:id,actuator,state:body.state,actor_id:null,source:String(body.source||'automatic'),reason:String(body.reason||''),sensor_snapshot:body.sensor_snapshot||{}};
+      const {error:eventError}=await service.from('actuator_events').insert(event);if(eventError)throw eventError;
+      await service.from('actuator_definitions').update({current_state:body.state,updated_at:new Date().toISOString()}).eq('device_id',id).contains('metadata',{firmware_id:actuator});
+      return json({ok:true,event:'stored'});
+    }
     if(body.action==='telemetry'){
       if(!existing)return json({error:'Enrolar primero'},409);
       if(!/^[a-f0-9-]{3,40}$/.test(String(body.boot_id||''))||!Number.isSafeInteger(body.sequence)||body.sequence<0||!Number.isFinite(body.uptime_ms)||body.uptime_ms<0||body.uptime_ms>4294967295)return json({error:'Telemetría inválida'},400);
