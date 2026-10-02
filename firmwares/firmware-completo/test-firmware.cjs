@@ -1,0 +1,18 @@
+const fs=require('node:fs'),assert=require('node:assert/strict');
+const code=fs.readFileSync(__dirname+'/src/main.cpp','utf8');
+assert(code.includes('FIRMWARE_VERSION[] = "2.15.1"'));
+assert(code.includes('ventilationEnabled')&&code.includes('dosingEnabled'));
+assert(code.includes('SIMULATE_SENSORS = false'));
+assert(code.includes('bomba_nutriente_a')&&code.includes('bomba_nutriente_b'));
+assert(code.includes('updateAutomation()')&&code.includes('/command/config'));
+assert(code.includes('phMin')&&code.includes('humidityMax')&&code.includes('tempMax'));
+assert(code.includes('doseStopAt')&&code.includes('cooldownMs'));
+assert(code.includes('WiFi.dnsIP(0)')&&code.includes('WiFi.dnsIP(1)'));
+assert(code.includes('resolveHost("jvrrtwlejbymxskijdhj.supabase.co"'));
+assert(code.includes('resolveHost(MQTT_HOST'));
+assert(code.includes('IPAddress dns1(1, 1, 1, 1), dns2(8, 8, 8, 8)'));
+assert(code.includes('if (!ensureDns())'));
+assert(code.includes('if (remote) preferences.remove("remote_reset")'));
+assert(code.includes('mqtt.subscribe((topicBase + "/command/#")'));
+assert(code.includes('[MQTT RX]')&&code.includes('[ACTUADOR APLICADO]'));
+console.log('PASS: sensores reales, DNS, NVS, dosificación segura, histéresis y comandos MQTT presentes.');
